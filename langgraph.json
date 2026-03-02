@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "rml_pipeline": "./graph/workflow.py:build_rml_graph"
+  },
+  "env": ".env"
+}

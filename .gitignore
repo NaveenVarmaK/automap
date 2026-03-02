@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+.idea/
+.vscode/
+
+# LangGraph API
+.langgraph_api/
+
+# Virtual environments
+.venv/
+venv/
+
+#Ignoring the contents of the data directory
+data/input/*
+data/output/*
+
+.env

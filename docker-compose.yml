@@ -1,0 +1,12 @@
+
+services:
+  rml-agent:
+    build:
+      context: .
+      network: host
+    container_name: LLM-Agent_RML
+    network_mode: "host"
+    env_file:
+      - .env
+    volumes:
+      - .:/app
