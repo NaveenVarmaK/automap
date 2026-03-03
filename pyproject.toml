@@ -14,4 +14,5 @@ dependencies = [
     "morph-kgc>=2.3.1",
     "pandas>=3.0.1",
     "rdflib>=7.6.0",
+    "yatter>=2.0.3",
 ]

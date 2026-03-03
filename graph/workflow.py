@@ -1,43 +1,64 @@
 from langgraph.graph import StateGraph, END
 from data.checkpoints import AgentState
-from graph.nodes import schema_agent_node, ontology_scout_node, mapper_agent_node, rml_architect_node
+from graph.nodes import schema_agent_node, ontology_scout_node, mapper_agent_node, yarrrml_architect_node, validation_node, refiner_agent_node
+from langgraph.checkpoint.memory import MemorySaver
+
 
 def build_rml_graph():
     workflow = StateGraph(AgentState)
 
-    # Node 1: Analyze Structure
+    # Node Definitions
     workflow.add_node("analyze_schema", schema_agent_node)
-
-    # Node 2: Find Ontology Matches
     workflow.add_node("scout_ontology", ontology_scout_node)
-
-    # Node 3: Create Mapping Logic (Reasoning)
     workflow.add_node("map_semantics", mapper_agent_node)
+    workflow.add_node("generate_yarrrml", yarrrml_architect_node)  # FIXED: Was pointing to a string "calidate_syntax"
+    workflow.add_node("validate_yarrrml", validation_node)  # FIXED: Ensure this node is added
+    workflow.add_node("refine_logic", refiner_agent_node)
 
-    # Node 4: Generate RML Code
-    workflow.add_node("generate_rml", rml_architect_node)
+    def syntax_check_routing(state):
+        feedback = state.get("feedback", "")
+        retries = state.get("retry_count", 0)
 
-    # Connections
+        if "SYNTAX_ERROR" in feedback:
+            if retries >= 3:
+                print("!!! MAX RETRIES REACHED: Syntax remains broken.")
+                return END
+            print(f"-> Syntax error detected. Loop {retries + 1}/3. Returning to Architect.")
+            return "generate_yarrrml"
+
+        return "refine_logic"
+
+    def logic_check_routing(state):
+        feedback = state.get("feedback", "")
+        if "LOGIC_ERROR" in feedback:
+            print("-> Logic error detected. Returning to Architect for refinement.")
+            return "generate_yarrrml"
+
+        print("-> Logic APPROVED. Proceeding to KG generation.")
+        return END  # Or "generate_kg" once implemented
+
+    # Entry Point
     workflow.set_entry_point("analyze_schema")
+
+    # Linear Connections
     workflow.add_edge("analyze_schema", "scout_ontology")
     workflow.add_edge("scout_ontology", "map_semantics")
-    workflow.add_edge("map_semantics", "generate_rml")
-    workflow.add_edge("generate_rml", END)
+    workflow.add_edge("map_semantics", "generate_yarrrml")
+    workflow.add_edge("generate_yarrrml", "validate_yarrrml")
 
-    # Memory Checkpoint (SQLite is easiest for local dev)
-    from langgraph.checkpoint.memory import MemorySaver
-    memory = MemorySaver()
+    # --- CONDITIONAL LOGIC (The "Loop") ---
 
-    return workflow.compile(checkpointer=memory)
-
-from agents.mapper_agent import call_mapper_llm
-
-def mapper_agent_node(state):
-    mapping = call_mapper_llm(
-        state["schema_info"],
-        state["ontology_info"]
+    # 1. After Syntax Validation
+    workflow.add_conditional_edges(
+        "validate_yarrrml",
+        lambda x: "generate_yarrrml" if "SYNTAX_ERROR" in x.get("feedback", "") else "refine_logic"
     )
-    return {
-        "mapping_plan": {"analysis": mapping},
-        "messages": [f"Mapper Agent: {mapping[:50]}..."]
-    }
+
+    # 2. After Logic Refinement
+    # This checks if the Refiner approved it or if it needs to go back to the architect
+    workflow.add_conditional_edges(
+        "refine_logic",
+        lambda x: END if "APPROVED" in x.get("feedback", "") else "generate_yarrrml"
+    )
+
+    return workflow.compile(checkpointer=MemorySaver())
