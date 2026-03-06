@@ -6,7 +6,7 @@
 
 ## Overview
 
-**Automap** is an experimental pipeline that leverages Large Language Models (LLMs) and [**LangGraph**](https://www.langchain.com/langgraph) to automate the creation of RML mappings and Knowledge Graph materialization. The system uses a multi-agent architecture to analyze CSV schemas, scout ontologies, and iteratively refine YARRRML mappings before final execution.
+**Automap** is a agentic pipeline that leverages Large Language Models (LLMs) and [**LangGraph**](https://www.langchain.com/langgraph) to automate the creation of RML mappings and Knowledge Graph materialization. The system uses a multi-agent architecture to analyze CSV schemas, scout ontologies, and iteratively refine YARRRML mappings before final execution.
 
 ### Key Features
 
@@ -99,7 +99,7 @@ The upstream dependency `morph-kgc` requires specific patches to support Python 
 * **`agents/`**: Core LLM logic for the Schema, Mapper, Architect, and Refiner agents.
 * **`graph/`**: LangGraph definitions (`workflow.py`) and node execution logic (`nodes.py`).
 * **`data/`**: Input CSVs/Ontologies and timestamped output run directories.
-* **`tools/`**: Contains funtions to extract some part of the csv and ontology from the given input.
+* **`tools/`**: Contains functions to extract small part of the csv and relevant ontology from the given input.
 * **`scripts/`**: Critical patch scripts for upstream dependency fixes.
 
 ---
@@ -132,3 +132,4 @@ This work has received funding from the **PIONERA** project (*Enhancing interope
 **Naveen Varma KALIDINDI** - naveen.kalidindi@upm.es
 
 *Universidad Politécnica de Madrid (UPM)*
+
