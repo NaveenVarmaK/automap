@@ -8,6 +8,26 @@
 
 **Automap** is a agentic pipeline that leverages Large Language Models (LLMs) and [**LangGraph**](https://www.langchain.com/langgraph) to automate the creation of RML mappings and Knowledge Graph materialization. The system uses a multi-agent architecture to analyze CSV schemas, scout ontologies, and iteratively refine YARRRML mappings before final execution.
 
+```mermaid
+stateDiagram-v2
+    [*] --> analyze_schema
+    analyze_schema --> scout_ontology
+    scout_ontology --> map_semantics
+    map_semantics --> generate_yarrrml
+    generate_yarrrml --> validate_yarrrml
+
+    state validate_yarrrml <<choice>>
+    validate_yarrrml --> generate_yarrrml : Syntax Error (Retries < 3)
+    validate_yarrrml --> [*] : Syntax Error (Retries >= 3)
+    validate_yarrrml --> refine_logic : No Syntax Error
+
+    state refine_logic <<choice>>
+    refine_logic --> generate_yarrrml : Logic Error
+    refine_logic --> generate_kg : No Logic Error
+
+    generate_kg --> [*]
+```
+
 ### Key Features
 
 * **Multi-Agent Orchestration:** Specialized agents for schema analysis, ontology mapping, and YARRRML architecture.
@@ -132,4 +152,5 @@ This work has received funding from the **PIONERA** project (*Enhancing interope
 **Naveen Varma KALIDINDI** - naveen.kalidindi@upm.es
 
 *Universidad Politécnica de Madrid (UPM)*
+
 
