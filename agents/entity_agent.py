@@ -41,6 +41,15 @@ Find the primary prefix in the ontology and use it.
 - If a column contains literal values (text, numbers, dates), map as:
   `[predicate, $(column), xsd:type]`   (3-item entry)
 
+### CRITICAL — ENTITY ID COLUMNS (columns ending in ID/Id/_id that are NOT the PK):
+If a CSV column is a *foreign-key ID* referencing a distinct real-world entity
+(e.g. CustomerID, DriverID, StoreID, ProductID — NOT the main row key), you MUST:
+1. Create a SEPARATE mapping for that entity type.
+2. In the referencing mapping, link to it via URI template (NOT a literal):
+     CORRECT: [schema:customer, ex:customer/$(CustomerID)~iri]
+     WRONG:   [schema:customer, $(CustomerID), xsd:string]  ← literal, NOT linked
+This makes the KG traversable. A literal CustomerID is useless for graph queries.
+
 ### CRITICAL — SAME-CSV FOREIGN KEYS:
 If a column is a foreign key referencing another row in the SAME CSV
 (like `parent_id`), link via a URI template:
@@ -131,6 +140,14 @@ RULE 14: When a dataset has many columns representing the same entity type
     - [a, ex:MedicationRecord]
     - [ex:drugName, 'metformin', xsd:string]
     - [ex:dosageStatus, $(metformin), xsd:string]
+
+RULE 15: Do NOT create a secondary mapping (Metadata, Info, etc.) UNLESS
+  the ontology explicitly declares a named object property (e.g. lkg:metadata,
+  onto:hasMetadata) whose range is a distinct class.
+  For FLAT datasets with no such property, ALL columns belong in the PRIMARY
+  mapping — do NOT invent Metadata or auxiliary mappings.
+  Ask yourself: "Is there an ontology property that links the primary entity
+  to this sub-entity?" If the answer is NO, do NOT create the sub-mapping.
 """
 
 
@@ -205,7 +222,63 @@ AVAILABLE CSV COLUMNS:
 Any column reference like $(xyz) MUST match one of the above exactly.
 """
 
-    # ── Coordinate-group disambiguation hints (Fix 2) ─────────────
+    # ── Primary key / subject identifier hint (Fix 2) ────────────────────
+    # If the dataset has no natural unique ID column, the LLM often picks a
+    # low-cardinality categorical column (e.g. Orientation with 4 values) as
+    # the subject ID — producing only 4 URIs for thousands of rows and making
+    # subject-level triple matching impossible.
+    pk_hint_section = ""
+    if csv_columns:
+        # Agnostic PK detection: only generic suffix/exact patterns, no dataset-specific names
+        _pk_generics = {'id', 'idx', 'index', 'row_id', 'rowid'}
+        _pk_suffixes = ('_id', '_no', '_num', '_code', '_key', '_number', '_uuid', '_hash')
+        pk_candidates = [
+            c for c in csv_columns
+            if c.lower() in _pk_generics or c.lower().endswith(_pk_suffixes)
+        ]
+        if pk_candidates:
+            pk_hint_section = f"""
+### PRIMARY KEY COLUMN: Use `$({pk_candidates[0]})` as the subject identifier.
+This column has unique values per row — ideal for URI templates.
+"""
+        else:
+            # No natural PK — try to detect high-cardinality numeric columns
+            # that could form a composite key.  Warn away from low-cardinality ones.
+            try:
+                import pandas as pd
+                _df_sample = pd.read_csv(state["csv_path"], nrows=500)
+                _cardinality = {c: _df_sample[c].nunique() for c in _df_sample.columns}
+                _n_rows = len(_df_sample)
+                # Low-cardinality: fewer than 10% unique values
+                low_card = [c for c, u in _cardinality.items() if u < max(5, _n_rows * 0.1)]
+                high_card = sorted(
+                    [c for c, u in _cardinality.items() if u >= _n_rows * 0.5],
+                    key=lambda c: -_cardinality[c]
+                )
+                low_card_str = ", ".join(f"'{c}' ({_cardinality[c]} values)" for c in low_card[:6])
+                composite_str = "/".join(f"$({c})" for c in high_card[:3]) if high_card else "$(col1)/$(col2)"
+                pk_hint_section = f"""
+### NO UNIQUE ID COLUMN DETECTED — CRITICAL SUBJECT URI RULES:
+This dataset has NO dedicated primary key column.
+Low-cardinality columns (DO NOT use as sole subject identifier): {low_card_str or 'none detected'}
+Using a low-cardinality column as the only subject part produces very few URIs
+(e.g. only 4 URIs for 10,000 rows) and makes the KG nearly useless.
+
+Instead, build a COMPOSITE subject from 2-3 high-cardinality columns:
+  GOOD:  s: ex:Building/{composite_str}
+  BAD:   s: ex:Building/$(Orientation)  ← only 4 distinct values = only 4 URIs
+
+Pick columns with the MOST unique values (closest to one-per-row).
+"""
+            except Exception:
+                pk_hint_section = """
+### NO UNIQUE ID COLUMN DETECTED:
+Build a COMPOSITE subject URI from 2-3 columns that together are unique per row.
+Do NOT use a single categorical/enum column as the sole subject identifier.
+Example: s: ex:Entity/$(col1)/$(col2)/$(col3)
+"""
+
+    # ── Coordinate-group disambiguation hints ─────────────────────
     # Detect groups of columns that share a naming prefix ending in
     # a geo-coordinate suffix (lat/long/lon/latitude/longitude).
     # When multiple groups exist (e.g. lat/long AND merch_lat/merch_long)
@@ -310,7 +383,32 @@ Do NOT use joins for same-CSV references — use URI templates instead.
             "column", "coverage", "missing", "duplicate", "predicate",
             "redundant", "data property",
         ]):
-            feedback_section = f"""
+            # ── Fix 1: Extract specific missing columns and inject as mandatory constraints ──
+            try:
+                from agents.refiner_agent import (
+                    _extract_missing_columns_from_feedback,
+                    _build_mandatory_column_injection,
+                )
+                missing_cols = _extract_missing_columns_from_feedback(feedback)
+                if missing_cols:
+                    mandatory_block = _build_mandatory_column_injection(missing_cols)
+                    feedback_section = f"""
+### FIX REQUIRED — Previous output had entity/column issues:
+{mandatory_block}
+
+{feedback}
+
+Make sure ALL CSV columns are mapped and each column appears in exactly ONE mapping.
+"""
+                else:
+                    feedback_section = f"""
+### FIX REQUIRED — Previous output had entity/column issues:
+{feedback}
+
+Make sure ALL CSV columns are mapped and each column appears in exactly ONE mapping.
+"""
+            except ImportError:
+                feedback_section = f"""
 ### FIX REQUIRED — Previous output had entity/column issues:
 {feedback}
 
@@ -331,8 +429,60 @@ Make sure ALL CSV columns are mapped and each column appears in exactly ONE mapp
 These columns were auto-injected in a previous attempt. Place them exactly as specified.
 """
 
+    # ── Base URI instruction ───────────────────────────────────────────────
+    # When the user has supplied a custom base URI, instruct the LLM to use
+    # it directly.  This reduces post-processing rewrites and makes the
+    # subject URIs semantically correct from the start.
+    _DEFAULT_BASE = "http://example.org/"
+    # Normalise: add http:// scheme if user passed bare domain like "mykg.org"
+    if base_uri and not base_uri.startswith(("http://", "https://", "urn:")):
+        base_uri = "http://" + base_uri
+    base_uri_section = ""
+    if base_uri and base_uri.rstrip("/") != _DEFAULT_BASE.rstrip("/"):
+        if not base_uri.endswith(("/", "#")):
+            base_uri = base_uri + "/"
+        try:
+            from urllib.parse import urlparse as _up
+            _host = (_up(base_uri).hostname or "base").replace("www.", "")
+            _parts = [p for p in _host.split(".") if p and p not in ("com", "org", "net", "io", "eu")]
+            _pfx = (_parts[0] if _parts else "base").replace("-", "").replace("_", "")
+            if not _pfx.isidentifier():
+                _pfx = "base"
+        except Exception:
+            _pfx = "base"
+        base_uri_section = f"""
+### CRITICAL — BASE URI FOR ALL ENTITY SUBJECTS:
+The user's knowledge graph lives at: {base_uri}
+Declare this prefix:  {_pfx}: "{base_uri}"
+Use it for ALL subject URI templates (s: fields):
+  CORRECT: s: {_pfx}:Film/$(movie_id)
+  WRONG:   s: dbo:Film/$(movie_id)   ← do NOT use ontology namespaces for subjects
+  WRONG:   s: http://example.org/Film/$(movie_id)  ← no bare URIs in s:
+Predicates (po: first items) may still use ontology prefixes like dbo:, schema:, etc.
+Only the SUBJECT templates must use the {_pfx}: prefix.
+"""
+
     # ── Dynamic human message (changes per call) ──
-    human_prompt = f"""{csv_column_section}
+    # At attempt 3+, aggressively truncate to prevent context overflow (400 error).
+    retry_count = state.get("retry_count", 0)
+    if retry_count >= 2:
+        # Keep only essentials: columns, PK hint, reduced alignment plan, top-3 failing CQs
+        alignment_section_trimmed = alignment_section[:1200] + "\n... (truncated)" if len(alignment_section) > 1200 else alignment_section
+        feedback_trimmed = feedback_section[:800] + "\n... (truncated)" if len(feedback_section) > 800 else feedback_section
+        ontology_trimmed = ontology[:1500] + "\n... (truncated)" if len(ontology) > 1500 else ontology
+        human_prompt = f"""{base_uri_section}{csv_column_section}
+{pk_hint_section}
+{alignment_section_trimmed}
+{feedback_trimmed}
+Target CSV: {csv_name}
+Source format (use exactly): [{csv_source}]
+Ontology Context: {ontology_trimmed}
+
+Generate the mappings: block now.
+"""
+    else:
+        human_prompt = f"""{base_uri_section}{csv_column_section}
+{pk_hint_section}
 {mapper_hint_section}
 {alignment_section}
 {cq_section}

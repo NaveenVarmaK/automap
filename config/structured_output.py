@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import os
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -36,6 +36,8 @@ def structured_output_enabled() -> bool:
 
 class PrefixesOutput(BaseModel):
     """The ``prefixes:`` block of a YARRRML file."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     prefixes: dict[str, str] = Field(
         description=(
             "Map of prefix name to URI. Example: "
@@ -51,6 +53,7 @@ class PrefixesOutput(BaseModel):
 
 class MappingBlock(BaseModel):
     """A single YARRRML mapping entry."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
     sources: list[list[str]] = Field(
         description=(
             'List of source specifications. Each source is a list with one '
@@ -77,6 +80,8 @@ class MappingBlock(BaseModel):
 
 class MappingsOutput(BaseModel):
     """The ``mappings:`` block of a YARRRML file."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     mappings: dict[str, MappingBlock] = Field(
         description="Map of mapping name to its definition."
     )

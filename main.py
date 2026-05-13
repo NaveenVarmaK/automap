@@ -26,7 +26,9 @@ Usage:
 
 import argparse
 import os
+import re
 import sys
+import warnings
 import time
 import uuid
 from datetime import datetime
@@ -34,6 +36,20 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Silence noisy deprecation warnings from third-party libraries
+warnings.filterwarnings("ignore", category=FutureWarning, module="morph_kgc")
+warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
+try:
+    import pandas as _pd
+    _pd.set_option('future.no_silent_downcasting', True)
+except Exception:
+    pass
+
+# Suppress duplicate/verbose logging from morph_kgc and yatter
+import logging as _logging
+_logging.getLogger("morph_kgc").setLevel(_logging.WARNING)
+_logging.getLogger("yatter").setLevel(_logging.WARNING)
 
 
 def parse_args():
@@ -61,7 +77,23 @@ def parse_args():
         "--cqs", nargs="*", type=str, default=None,
         help="Competency Questions for CQ validation. "
              "Pass as quoted strings: --cqs 'Can I identify the publisher?' 'Who authored it?' "
-             "Or pass a file path: --cqs @cqs.txt (one question per line).",
+             "Or pass a file path: --cqs @cqs.txt (one question per line). "
+             "If omitted, CQs are auto-generated from the schema and ontology.",
+    )
+    parser.add_argument(
+        "--base-uri", type=str, default=None, dest="base_uri",
+        help="Base URI for all subject (entity) URIs in the generated KG. "
+             "E.g. --base-uri http://mykg.org/  "
+             "Overrides the BASE_URI environment variable. "
+             "When set, all subject templates like dbo:Film/$(id) are rewritten "
+             "to use this namespace: mykg:Film/$(id).",
+    )
+    parser.add_argument(
+        "--sparql", nargs="*", type=str, default=None,
+        help="Direct SPARQL ASK queries to validate against the generated KG. "
+             "Executed as-is — no LLM translation. "
+             "Pass as quoted strings: --sparql 'ASK { ?s a ex:Class }' "
+             "Or pass a file path: --sparql @queries.rq (one query per line, separated by blank lines).",
     )
     return parser.parse_args()
 
@@ -98,12 +130,42 @@ def main():
         print(f"  Loaded {len(competency_questions)} Competency Question(s)")
         for i, q in enumerate(competency_questions, 1):
             print(f"    CQ{i}: {q}")
+    else:
+        print("  No CQs provided — will auto-generate from schema + ontology.")
+
+    # ── Parse direct SPARQL queries ──────────────────────────────
+    user_sparql_queries = []
+    if args.sparql:
+        for item in args.sparql:
+            file_path = item[1:] if item.startswith("@") else item
+            if os.path.isfile(file_path):
+                # Load from file: queries separated by blank lines
+                with open(file_path) as f:
+                    raw = f.read()
+                for block in re.split(r'\n\s*\n', raw):
+                    block = block.strip()
+                    if block and block.upper().startswith("ASK"):
+                        user_sparql_queries.append(block)
+            else:
+                user_sparql_queries.append(item)
+
+    if user_sparql_queries:
+        print(f"  Loaded {len(user_sparql_queries)} direct SPARQL query(ies)")
+
+    # ── Normalise base URI ───────────────────────────────────────
+    raw_base_uri = args.base_uri or os.getenv("BASE_URI", "http://example.org/")
+    # If user passed a bare domain (e.g. mykg.org), add the http:// scheme
+    if raw_base_uri and not raw_base_uri.startswith(("http://", "https://", "urn:")):
+        raw_base_uri = "http://" + raw_base_uri
+        print(f"  [INFO] Base URI normalised to: {raw_base_uri}")
 
     initial_state = {
         "csv_path": os.getenv("INPUT_CSV_PATH"),
         "ontology_path": os.getenv("INPUT_ONTOLOGY_PATH"),
-        "base_uri": os.getenv("BASE_URI", "http://example.org/"),
+        "base_uri": raw_base_uri,
         "competency_questions": competency_questions,
+        "generated_cqs": [],
+        "user_sparql_queries": user_sparql_queries,
         "schema_info": {},
         "ontology_info": {},
         "mapping_plan": {},
@@ -112,10 +174,10 @@ def main():
         "entity_yarrrml": "",
         "yarrrml_output": "",
         "rdf_output": "",
-        "cq_validation": {},
+        "sparql_validation_results": [],
         "feedback": "",
         "retry_count": 0,
-        "cq_retry_count": 0,
+        "cq_sparql_retry_count": 0,
         "messages": [],
         "run_dir": run_directory,
         "predicate_conflict_cols": [],
@@ -123,103 +185,220 @@ def main():
 
     config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
-    print("\n" + "=" * 50)
-    print(" STARTING AGENTIC RML PIPELINE")
-    print("=" * 50 + "\n")
+    # ── Stage metadata for display ────────────────────────────────
+    _STAGE_LABELS = {
+        "analyze_schema":     "Schema Analysis",
+        "scout_ontology":     "Ontology Scout",
+        "map_semantics":      "Semantic Mapper",
+        "generate_cqs":       "CQ Generator",
+        "align_schema":       "Schema Alignment",
+        "generate_yarrrml":   "YARRRML Generator",
+        "validate_yarrrml":   "Syntax Validator",
+        "refine_logic":       "Logic Refiner",
+        "generate_kg":        "KG Generator",
+        "sparql_validate_cqs":"SPARQL CQ Validator",
+    }
+
+    def _bar(char="=", width=62):
+        return char * width
+
+    print(f"\n  {'=' * 64}")
+    print(f"  {'AGENTIC RML PIPELINE':^64}")
+    print(f"  {'Run: ' + current_run_timestamp:^64}")
+    print(f"  {'=' * 64}\n")
 
     # ── Execute pipeline with timing ─────────────────────────────
     t0 = time.time()
+    stage_times: dict[str, float] = {}
+    stage_start = time.time()
 
     for event in app.stream(initial_state, config):
         for node_name, output in event.items():
-            print(f" [STAGE]: {node_name}")
+            elapsed_stage = time.time() - stage_start
+            stage_times[node_name] = elapsed_stage
+            label = _STAGE_LABELS.get(node_name, node_name)
+            print(f"\n  +-- {label}  ({elapsed_stage:.1f}s) {'-' * max(2, 44 - len(label))}+")
 
-            if "messages" in output:
-                print(f"    {output['messages'][-1]}")
+            # ── Per-node detail ──────────────────────────────────
+            if node_name == "analyze_schema":
+                schema = output.get("schema_info", {})
+                raw = schema.get("raw", {})
+                cols = raw.get("columns", []) if isinstance(raw, dict) else []
+                print(f"  |  Columns detected : {len(cols)}")
+                if cols:
+                    print(f"  |  {', '.join(str(c) for c in cols[:8])}{'...' if len(cols) > 8 else ''}")
 
-            if node_name == "align_schema":
-                alignment = output.get("schema_alignment", {})
-                tag = "MULTI-NODE" if alignment.get("multi_node") else "FLAT"
-                print(f"    Entity Structure: {tag}")
-
-            if node_name == "validate_yarrrml":
-                status = "VALID" if "PASSED" in output.get("feedback", "") else "INVALID"
-                print(f"    Syntax Status: {status}")
-
-            if node_name == "validate_cqs":
-                fb = output.get("feedback", "")
-                if "CQ_SKIPPED" in fb:
-                    print(f"    CQ Status: SKIPPED (no competency questions)")
-                elif "CQ_PASSED" in fb:
-                    print(f"    CQ Status: ALL PASSED")
+            elif node_name == "scout_ontology":
+                ont_raw = output.get("ontology_info", {}).get("raw", {})
+                if isinstance(ont_raw, dict):
+                    n_cls = len(ont_raw.get("classes", []))
+                    n_op  = len(ont_raw.get("object_properties", []))
+                    n_dp  = len(ont_raw.get("data_properties", []))
+                    print(f"  |  Classes: {n_cls}  |  Object props: {n_op}  |  Data props: {n_dp}")
                 else:
-                    print(f"    CQ Status: FAILED — re-routing for fix")
+                    preview = str(ont_raw)[:80].replace("\n", " ")
+                    print(f"  |  Ontology subgraph extracted: {preview}...")
 
-            if node_name == "refine_logic":
-                print(f"    Refiner Feedback: {output.get('feedback', 'No feedback')}")
-                status = " APPROVED" if output.get("feedback") == "APPROVED" else " NEEDS FIX"
-                print(f"    Logic Review: {status}")
+            elif node_name == "generate_cqs":
+                gen = output.get("generated_cqs", [])
+                user = initial_state.get("competency_questions", [])
+                if gen:
+                    print(f"  |  Auto-generated {len(gen)} CQ(s)  (saved to cqs.txt)")
+                elif user:
+                    print(f"  |  Using {len(user)} user-provided CQ(s)  (saved to cqs.txt)")
+                else:
+                    print(f"  |  No CQs available -- SPARQL validation will be skipped")
+
+            elif node_name == "align_schema":
+                alignment = output.get("schema_alignment", {})
+                alignment = alignment if isinstance(alignment, dict) else {}
+                tag = "MULTI-NODE" if alignment.get("multi_node") else "FLAT"
+                plan = alignment.get("entity_plan") or ""
+                entities = [l for l in str(plan)[:120].split("\n") if l.strip()][:2]
+                print(f"  |  Structure  : {tag}")
+                for e in entities:
+                    print(f"  |  {e.strip()[:60]}")
+
+            elif node_name == "generate_yarrrml":
+                retries = output.get("retry_count", 0)
+                yarrrml = output.get("yarrrml_output", "")
+                n_lines = len(yarrrml.splitlines())
+                print(f"  |  Attempt #{retries}  |  YARRRML lines: {n_lines}")
+
+            elif node_name == "validate_yarrrml":
+                fb = output.get("feedback", "")
+                if "PASSED" in fb:
+                    print(f"  |  [PASS] YARRRML syntax is valid")
+                else:
+                    err = fb.replace("SYNTAX_ERROR:", "").strip()[:120]
+                    print(f"  |  [FAIL] Syntax error -- will retry")
+                    print(f"  |  {err}")
+
+            elif node_name == "refine_logic":
+                fb = output.get("feedback", "")
+                if "APPROVED" in fb:
+                    print(f"  |  [PASS] Logic check passed -- mapping approved")
+                elif "LOGIC_ERROR" in fb:
+                    lines = [l for l in fb.splitlines() if l.strip()][:5]
+                    print(f"  |  [FAIL] Logic issues found -- will retry")
+                    for l in lines:
+                        print(f"  |    {l[:80]}")
+                else:
+                    print(f"  |  {fb[:100]}")
+
+            elif node_name == "generate_kg":
+                rdf = output.get("rdf_output", "")
+                if rdf:
+                    size = os.path.getsize(rdf) if os.path.exists(rdf) else 0
+                    print(f"  |  [OK] KG materialised: {rdf}")
+                    print(f"  |  File size: {size / 1024:.1f} KB")
+                else:
+                    print(f"  |  [FAIL] KG generation failed")
+
+            elif node_name == "sparql_validate_cqs":
+                fb = output.get("feedback", "")
+                results = output.get("sparql_validation_results", [])
+                n_total  = len(results)
+                n_passed = sum(1 for r in results if r.get("passed") is True)
+                n_failed = sum(1 for r in results if r.get("passed") is False)
+                n_skip   = sum(1 for r in results if r.get("passed") is None)
+                retry_n  = output.get("cq_sparql_retry_count", 0)
+                if "CQ_SPARQL_PASSED" in fb:
+                    print(f"  |  [PASS] All checks passed  ({n_passed}/{n_total})")
+                elif "CQ_SPARQL_ERROR" in fb:
+                    print(f"  |  [FAIL] {n_failed}/{n_total} check(s) failed  "
+                          f"(retry {retry_n}) -- routing back to generator")
+                    for r in results:
+                        if r.get("passed") is False:
+                            src = r.get("source", "?")
+                            print(f"  |    FAIL [{src}] {r['cq'][:65]}")
+                else:
+                    print(f"  |  No CQs or SPARQL queries provided -- skipped")
+                if n_skip:
+                    print(f"  |  WARNING: {n_skip} check(s) had SPARQL generation issues -- skipped")
+
+            # Always print the agent message if present
+            if "messages" in output and output["messages"]:
+                msg = output["messages"][-1]
+                print(f"  |  -> {msg[:100]}")
+
+            print(f"  +{'-' * 62}+")
+            stage_start = time.time()
 
     elapsed = time.time() - t0
-
-    print("\n" + "=" * 50)
-    print(" PIPELINE COMPLETE")
-    print("=" * 50)
-
     result = app.get_state(config).values
 
-    if result.get("rdf_output"):
-        print(f" Success! Knowledge Graph: {result['rdf_output']}")
-    else:
-        retries = result.get('retry_count', 0)
-        feedback = result.get('feedback', '')
-        if retries >= 6 and "LOGIC_ERROR" in feedback:
-            print(f"[FAIL] Failure: Logic retry limit reached ({retries} attempts). Last feedback:")
-            # Print just the first few lines of feedback for clarity
-            for line in feedback.split('\n')[:8]:
-                print(f"    {line}")
-        elif retries >= 10 and "SYNTAX_ERROR" in feedback:
-            print(f"[FAIL] Failure: Syntax retry limit reached ({retries} attempts).")
-        else:
-            print("[FAIL] Failure: Knowledge Graph was not generated.")
+    # ── Final Summary ─────────────────────────────────────────────
+    print(f"\n  {'=' * 64}")
+    print(f"  {'PIPELINE SUMMARY':^64}")
+    print(f"  {'=' * 64}")
 
-    # Save YARRRML (even on failure — for debugging)
+    rdf_path  = result.get("rdf_output", "")
+    kg_ok     = bool(rdf_path and os.path.exists(rdf_path))
+    retries   = result.get("retry_count", 0)
+    sparql_results = result.get("sparql_validation_results", [])
+    n_cq_pass = sum(1 for r in sparql_results if r.get("passed") is True)
+    n_cq_fail = sum(1 for r in sparql_results if r.get("passed") is False)
+
+    kg_status = "YES  --> " + rdf_path if kg_ok else "NO"
+    print(f"  KG generated   : {kg_status}")
+    print(f"  Total retries  : {retries}")
+    print(f"  Total time     : {elapsed:.1f}s")
+    if sparql_results:
+        print(f"  CQ checks      : {n_cq_pass} passed / {n_cq_fail} failed")
+
+    # Stage timing table
+    print(f"\n  {'Stage':<38} {'Time':>8}  Progress")
+    print(f"  {'-' * 62}")
+    for sname, stime in stage_times.items():
+        slabel = _STAGE_LABELS.get(sname, sname)
+        bar_len = min(10, int(stime / max(elapsed, 1) * 10))
+        tbar = "#" * bar_len + "." * (10 - bar_len)
+        print(f"  {slabel:<38} {stime:>6.1f}s  [{tbar}]")
+    print(f"  {'=' * 64}\n")
+
+    # ── Output file summary ───────────────────────────────────────
+    print(f"  Run directory: {run_directory}")
+
     yarrrml_content = result.get("yarrrml_output", "")
     if yarrrml_content:
         mapping_filename = os.path.join(run_directory, "final_mapping.yaml")
         with open(mapping_filename, "w") as f:
             f.write(yarrrml_content)
-        print(f" Mapping saved to: {mapping_filename}")
+        print(f"  [saved] final_mapping.yaml  ({len(yarrrml_content.splitlines())} lines)")
 
-    # List per-attempt debug files
+    if kg_ok:
+        sz = os.path.getsize(rdf_path) / 1024
+        print(f"  [saved] knowledge_graph.nt  ({sz:.1f} KB)")
+
+    cqs_file = os.path.join(run_directory, "cqs.txt")
+    if os.path.exists(cqs_file):
+        print(f"  [saved] cqs.txt")
+
+    for fname in sorted(os.listdir(run_directory)):
+        if fname.startswith("sparql_validation"):
+            print(f"  [saved] {fname}")
+
     debug_dir = os.path.join(run_directory, "debug")
     if os.path.isdir(debug_dir):
         attempt_files = sorted(f for f in os.listdir(debug_dir) if f.startswith("attempt_"))
         if attempt_files:
-            print(f" Debug files ({len(attempt_files)}) saved in: {debug_dir}/")
-            for f in attempt_files:
-                print(f"    - {f}")
+            print(f"  [debug] debug/  ({len(attempt_files)} YARRRML attempt(s))")
 
-    # Check RDF output
-    rdf_path = result.get("rdf_output", "")
-    if rdf_path and os.path.exists(rdf_path):
-        print(f" Knowledge Graph generated at: {rdf_path}")
-    else:
-        print("Knowledge Graph was not generated. Check agent feedback.")
+    if not kg_ok:
+        fb = result.get("feedback", "")
+        print(f"\n  [FAIL] Pipeline did not produce a KG.  Last feedback:")
+        for line in fb.split("\n")[:10]:
+            if line.strip():
+                print(f"         {line[:100]}")
 
-    print("-" * 30)
-    print(f"Total loop attempts: {result.get('retry_count', 0)}")
-    print(f"Total time: {elapsed:.1f}s")
-    print("-" * 30)
+    print()
 
     # ── Evaluation ───────────────────────────────────────────────
     eval_levels = args.eval_levels
     if eval_levels is not None:
-        # --eval with no numbers means "all levels"
         if not eval_levels:
             eval_levels = [1, 2, 3]
-
-        # Validate
         eval_levels = sorted(set(eval_levels))
         invalid = [l for l in eval_levels if l not in (1, 2, 3)]
         if invalid:
@@ -232,7 +411,6 @@ def main():
             import json
 
             gold_path = args.gold
-            # Fallback: try standard location
             if gold_path is None and 2 in eval_levels:
                 default_gold = "data/gold/bikeshare_gold.nt"
                 if os.path.isfile(default_gold):
@@ -241,7 +419,6 @@ def main():
                     print("[WARN] No --gold path provided and data/gold/bikeshare_gold.nt not found.")
                     print("   Level 2 evaluation will be skipped.")
 
-            # Ensure the pipeline result has csv_path for Level 3
             if "csv_path" not in result:
                 result["csv_path"] = os.getenv("INPUT_CSV_PATH")
 
@@ -251,17 +428,13 @@ def main():
                 gold_kg_path=gold_path,
                 elapsed_time=elapsed,
             )
-
-            # Stamp model / temperature configuration into metrics
             metrics.update(get_llm_metadata())
-
             print_metrics(metrics, eval_levels)
 
-            # Save metrics JSON alongside the run
             metrics_file = os.path.join(run_directory, "eval_metrics.json")
             with open(metrics_file, "w") as f:
                 json.dump(metrics, f, indent=2, default=str)
-            print(f"\nEvaluation metrics saved to: {metrics_file}")
+            print(f"\n  Evaluation metrics saved to: {metrics_file}")
 
     # ── Dashboard ────────────────────────────────────────────────
     if args.dashboard is not None:
@@ -277,4 +450,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
 

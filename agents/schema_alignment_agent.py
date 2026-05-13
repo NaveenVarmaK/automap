@@ -13,9 +13,62 @@ naively mapped 1:1 to a single entity when the ontology actually
 requires multiple interconnected nodes.
 """
 
-from config.settings import get_llm, get_llm_with_retry
+from config.settings import get_llm_with_retry
 from config.yarrrml_examples import GOLDEN_RULES
 from langchain_core.messages import SystemMessage, HumanMessage
+import re as _re
+
+
+def _parse_object_properties(ontology_raw: str) -> list[dict]:
+    """Parse owl:ObjectProperty declarations from Turtle ontology text.
+
+    Returns list of dicts: {name, domain, range} using CURIE forms.
+    Used to inject deterministic hints into the schema alignment prompt
+    so the LLM knows which predicates MUST link to IRI entities.
+    """
+    if not ontology_raw:
+        return []
+
+    # Build prefix map from @prefix declarations
+    prefix_map: dict[str, str] = {}
+    for pm in _re.finditer(r'@prefix\s+(\w*):\s*<([^>]+)>', ontology_raw):
+        prefix_map[pm.group(1)] = pm.group(2)
+
+    def _uri_to_curie(uri: str) -> str:
+        for pfx, base in sorted(prefix_map.items(), key=lambda x: -len(x[1])):
+            if uri.startswith(base):
+                return f"{pfx}:{uri[len(base):]}"
+        return uri
+
+    obj_props: list[dict] = []
+    # Find blocks like: <uri> a owl:ObjectProperty ; rdfs:domain <x> ; rdfs:range <y>
+    # Also handles short-form: propName a owl:ObjectProperty ;
+    block_re = _re.compile(
+        r'([\w:]+|<[^>]+>)\s+a\s+owl:ObjectProperty\s*;([^.]+)\.',
+        _re.DOTALL,
+    )
+    for m in block_re.finditer(ontology_raw):
+        prop_raw = m.group(1).strip('<>').strip()
+        body = m.group(2)
+
+        domain_m = _re.search(r'rdfs:domain\s+([\w:]+|<[^>]+>)', body)
+        range_m = _re.search(r'rdfs:range\s+([\w:]+|<[^>]+>)', body)
+
+        prop_curie = _uri_to_curie(prop_raw) if prop_raw.startswith('http') else prop_raw
+        domain_curie = None
+        range_curie = None
+
+        if domain_m:
+            d = domain_m.group(1).strip('<>')
+            domain_curie = _uri_to_curie(d) if d.startswith('http') else d
+        if range_m:
+            r = range_m.group(1).strip('<>')
+            range_curie = _uri_to_curie(r) if r.startswith('http') else r
+
+        if range_curie:
+            obj_props.append({"name": prop_curie, "domain": domain_curie, "range": range_curie})
+
+    return obj_props
 
 
 def call_schema_alignment_agent(state: dict) -> dict:
@@ -36,16 +89,39 @@ def call_schema_alignment_agent(state: dict) -> dict:
         ``multi_node``   – bool indicating whether multi-node mapping is
         required.
     """
-    llm = get_llm_with_retry(role="schema_alignment")
-
     ontology = state.get("ontology_info", {}).get("raw", "")
     schema = state.get("schema_info", {})
     columns = schema.get("raw", {}).get("columns", [])
+    base_uri = state.get("base_uri", "http://example.org/")
+    feedback = state.get("feedback", "")
+
+    # ── Fast path: deterministic plan from ontology (< 0.5 s) ────────
+    # Skip on retries after CQ/logic failures so the LLM can fix
+    # structural problems the heuristic can't catch on its own.
+    is_retry = bool(feedback) and not any(
+        kw in feedback for kw in ("APPROVED", "PASSED")
+    )
+
+    if not is_retry:
+        try:
+            from agents.ontology_entity_planner import build_deterministic_entity_plan
+            plan_text, multi_node = build_deterministic_entity_plan(
+                ontology, columns, base_uri
+            )
+            if "ENTITY:" in plan_text:
+                print("  [Schema Alignment] Deterministic plan built (<1s) — skipping LLM")
+                return {"entity_plan": plan_text, "multi_node": multi_node}
+        except Exception as _det_err:
+            print(f"  [Schema Alignment] Deterministic plan failed ({_det_err}), falling back to LLM")
+
+    # ── Slow path: LLM (retries or sparse ontology) ───────────────────
+    print("  [Schema Alignment] Using LLM (retry or sparse ontology)...")
+    llm = get_llm_with_retry(role="schema_alignment")
+
     unique_cols = schema.get("raw", {}).get("unique_columns", [])
     sample = schema.get("raw", {}).get("sample", "")
     analysis = schema.get("analysis", "")
     mapping_plan = state.get("mapping_plan", {}).get("analysis", "")
-    base_uri = state.get("base_uri", "http://example.org/")
 
     # Include competency questions if provided
     cq_section = ""
@@ -61,34 +137,6 @@ proposed entity structure.  If a CQ requires distinguishing a parent
 entity from a child entity, you MUST split them into separate mappings.
 """
 
-    # Parse CQs to extract mandatory entity classes
-    cq_entities: list[str] = []
-    for cq in cqs:
-        cq_lower = cq.lower()
-        if any(kw in cq_lower for kw in ["diagnosis", "icd", "diag"]):
-            cq_entities.append("DiagnosisMapping (required by CQ about diagnoses)")
-        if any(kw in cq_lower for kw in ["drug", "medication", "insulin", "dosage", "prescri"]):
-            cq_entities.append("MedicationRecordMapping (required by CQ about drugs/medication)")
-        if any(kw in cq_lower for kw in ["age", "race", "gender", "demographic"]):
-            cq_entities.append("PatientDemographics or MetadataMapping (required by CQ about demographics)")
-        if any(kw in cq_lower for kw in ["patient", "person", "cardholder"]):
-            cq_entities.append("PatientMapping or PersonMapping (required by CQ about patients/persons)")
-        if any(kw in cq_lower for kw in ["merchant", "vendor", "seller"]):
-            cq_entities.append("MerchantMapping (required by CQ about merchants)")
-        if any(kw in cq_lower for kw in ["transaction", "payment", "order"]):
-            cq_entities.append("TransactionMapping (required by CQ about transactions)")
-        if any(kw in cq_lower for kw in ["address", "location", "city", "street"]):
-            cq_entities.append("AddressMapping (required by CQ about addresses/locations)")
-
-    if cq_entities:
-        unique_entities = sorted(set(cq_entities))
-        entity_list = "\n".join(f"  - {e}" for e in unique_entities)
-        cq_section += f"""
-### MANDATORY ENTITY CLASSES — these MUST appear as separate mappings:
-{entity_list}
-Do NOT merge these into a flat single mapping. Each must be a distinct
-mapping block with its own subject template and rdf:type.
-"""
 
     # On retries after CQ failure, inject the failure feedback so
     # the alignment agent knows what structural problems to fix.
@@ -164,6 +212,23 @@ blueprint that downstream agents will follow when generating YARRRML.
 2. **Classify each CSV column** into one of:
    - **IRI column** — contains full URLs/IRIs (http://, https://, etc.)
      → map as ``$(column)~iri`` directly. Do NOT create separate mappings.
+   - **Entity ID column** — contains IDs that identify a DISTINCT ENTITY TYPE
+     (e.g. ``CustomerID``, ``ProductID``, ``DriverID``, ``StoreID``).
+     Multiple rows share the same ID value, meaning each unique value
+     represents a real-world entity (a customer, a product, etc.).
+     → Create a SEPARATE mapping for that entity:
+       ```
+       CustomerMapping:
+         s: ex:customer/$(CustomerID)
+         po:
+           - [a, schema:Person]
+           - [schema:identifier, $(CustomerID), xsd:string]
+       ```
+     → In the REFERENCING mapping (e.g. InvoiceMapping), link via IRI:
+       ```[schema:customer, ex:customer/$(CustomerID)~iri]```
+     KEY HEURISTIC: A column is an entity ID if (a) its name ends in ``ID``
+     or ``Id`` or ``_id``, AND (b) it is NOT the primary/composite key of
+     the main entity (e.g. ``InvoiceNo`` is the PK, ``CustomerID`` is FK).
    - **Foreign key column** — contains an ID referencing another entity
      in the SAME CSV (like ``parent_id``)
      → link via URI template: ``prefix:Class/$(fk_col)~iri``
@@ -252,10 +317,60 @@ ENTITY: <MetadataMappingName>  (if metadata property exists)
 6. A column CAN appear in multiple entities with DIFFERENT predicates.
 7. Primary links TO Metadata.  Metadata does NOT self-link.
 8. Output ONLY the entity plan — no YARRRML, no code blocks.
+9. **CRITICAL — ONTOLOGY OBJECT PROPERTIES:**
+   Scan the ontology for ALL ``owl:ObjectProperty`` declarations.
+   For each ObjectProperty with a declared ``rdfs:range`` class:
+   - The range class MUST become a separate entity mapping.
+   - The CSV column that contains IDs for that range class MUST be
+     identified as an ENTITY ID COLUMN (see rule 2 above).
+   - The referencing mapping MUST use a URI_TEMPLATE_LINK:
+       ``schema:customer -> ex:customer/$(CustomerID)~iri``
+   Example: if ontology has:
+     ``schema:customer a owl:ObjectProperty ; rdfs:domain schema:Order ; rdfs:range schema:Person``
+   Then you MUST create:
+     - A ``CustomerMapping`` with ``s: ex:customer/$(CustomerID)`` and class ``schema:Person``
+     - In ``InvoiceMapping``: ``URI_TEMPLATE_LINKS: schema:customer -> ex:customer/$(CustomerID)~iri``
+   Do NOT map ObjectProperty range values as literals (xsd:string).
 """
 
+    # ── Parse ObjectProperties from ontology for deterministic hints ──
+    obj_props = _parse_object_properties(ontology)
+    obj_prop_section = ""
+    if obj_props:
+        lines = ["### ONTOLOGY OBJECT PROPERTIES — each range class MUST become a separate mapping:"]
+        for op in obj_props:
+            domain = op.get("domain") or "?"
+            range_ = op["range"]
+            name = op["name"]
+            lines.append(
+                f"  - {name}: domain={domain}, range={range_}  "
+                f"→ create a separate mapping for {range_} entities "
+                f"and link via URI template"
+            )
+        obj_prop_section = "\n".join(lines) + "\n"
+
     # ── Dynamic human message (changes per call) ──
-    human_prompt = f"""### INPUT
+    # At attempt 3+ aggressively truncate to prevent context overflow (400 Bad Request).
+    retry_count = state.get("retry_count", 0)
+    if retry_count >= 2:
+        # Slim-mode: only columns, top-3 failing CQs, truncated ontology
+        ontology_trimmed = ontology[:2000] + "\n...(truncated)" if len(ontology) > 2000 else ontology
+        # Keep only the first failing CQs from cq_section
+        cq_section_trimmed = cq_section[:600] + "\n...(truncated)" if len(cq_section) > 600 else cq_section
+        human_prompt = f"""### INPUT (slim — attempt {retry_count + 1})
+
+**Ontology (truncated):**
+{ontology_trimmed}
+
+**CSV Columns:** {columns}
+
+**Base URI:** {base_uri}
+{obj_prop_section}{cq_section_trimmed}
+
+Produce the Functional Entity Plan now.
+"""
+    else:
+        human_prompt = f"""### INPUT
 
 **Ontology:**
 {ontology}
@@ -276,7 +391,7 @@ override or ignore them. Place each column in the mapping that matches the class
 it was assigned to.
 
 **Base URI:** {base_uri}
-{cq_section}
+{obj_prop_section}{cq_section}
 
 Produce the Functional Entity Plan now.
 """

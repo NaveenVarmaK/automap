@@ -1,5 +1,6 @@
 import re
 from config.settings import get_llm
+from config.prefixes import WELL_KNOWN_PREFIXES, IMPLICIT_PREFIXES, URI_SCHEMES
 from data.checkpoints import AgentState
 
 
@@ -23,6 +24,55 @@ def _extract_yarrrml_columns(yarrrml_str: str) -> set[str]:
             if part:
                 found.add(part)
     return found
+
+
+def build_column_alias_map(csv_columns: set[str]) -> dict[str, str]:
+    """Build a mapping from sanitised column names back to real CSV column names.
+
+    When LLMs see column names with hyphens (e.g. ``metformin-pioglitazone``),
+    they silently convert them to underscores in YARRRML templates
+    (``$(metformin_pioglitazone)``). Morph-KGC then fails because the CSV
+    column is ``metformin-pioglitazone``, not ``metformin_pioglitazone``.
+
+    This function builds the reverse mapping:
+        'metformin_pioglitazone' → 'metformin-pioglitazone'
+
+    Only creates entries where sanitised != original.
+    Fully agnostic — works for hyphens, spaces, dots, and any non-word char.
+    """
+    alias_map: dict[str, str] = {}
+    for col in csv_columns:
+        sanitised = re.sub(r'[^a-zA-Z0-9_]', '_', col)
+        if sanitised != col:
+            alias_map[sanitised] = col
+    return alias_map
+
+
+def restore_column_names(yarrrml_str: str, alias_map: dict[str, str]) -> tuple[str, list[str]]:
+    """Replace sanitised column references in YARRRML with real CSV column names.
+
+    Handles both ``$(col_name)`` and ``{col_name}`` template patterns.
+    Sorts by length descending to prevent partial replacements
+    (e.g. fixes ``metformin_pioglitazone`` before ``metformin``).
+
+    Returns ``(fixed_yarrrml, list_of_fix_descriptions)``.
+    """
+    if not alias_map:
+        return yarrrml_str, []
+
+    fixes: list[str] = []
+    result = yarrrml_str
+
+    for sanitised, real in sorted(alias_map.items(), key=lambda x: -len(x[0])):
+        pattern_paren = re.compile(r'\$\(' + re.escape(sanitised) + r'\)')
+        pattern_brace = re.compile(r'\{' + re.escape(sanitised) + r'\}')
+
+        if pattern_paren.search(result) or pattern_brace.search(result):
+            result = pattern_paren.sub(f'$({real})', result)
+            result = pattern_brace.sub('{' + real + '}', result)
+            fixes.append(f"Restored column name: '{sanitised}' -> '{real}'")
+
+    return result, fixes
 
 
 def _parse_yarrrml(yarrrml_str: str):
@@ -66,37 +116,11 @@ def _detect_empty_columns(csv_path: str) -> set[str]:
 
 
 # ────────────────────────────────────────────────────────────────────
-# Well-known prefix URIs for deterministic auto-fix
+# Shared prefix constants (consolidated into config/prefixes.py)
 # ────────────────────────────────────────────────────────────────────
-
-_WELL_KNOWN_PREFIXES: dict[str, str] = {
-    "rdf":     "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-    "rdfs":    "http://www.w3.org/2000/01/rdf-schema#",
-    "owl":     "http://www.w3.org/2002/07/owl#",
-    "xsd":     "http://www.w3.org/2001/XMLSchema#",
-    "schema":  "http://schema.org/",
-    "foaf":    "http://xmlns.com/foaf/0.1/",
-    "dc":      "http://purl.org/dc/elements/1.1/",
-    "dcterms": "http://purl.org/dc/terms/",
-    "dct":     "http://purl.org/dc/terms/",
-    "skos":    "http://www.w3.org/2004/02/skos/core#",
-    "geo":     "http://www.w3.org/2003/01/geo/wgs84_pos#",
-    "dcat":    "http://www.w3.org/ns/dcat#",
-    "prov":    "http://www.w3.org/ns/prov#",
-    "gtfs":    "http://vocab.gtfs.org/terms#",
-    "vcard":   "http://www.w3.org/2006/vcard/ns#",
-    "void":    "http://rdfs.org/ns/void#",
-    "time":    "http://www.w3.org/2006/time#",
-    "sosa":    "http://www.w3.org/ns/sosa/",
-    "ssn":     "http://www.w3.org/ns/ssn/",
-    "wgs":     "http://www.w3.org/2003/01/geo/wgs84_pos#",
-}
-
-# Prefixes that YARRRML / Yatter treats as implicitly available
-_IMPLICIT_PREFIXES = {"xsd", "rdf", "rdfs"}
-
-# URI schemes to exclude when scanning for prefix usage
-_URI_SCHEMES = {"http", "https", "ftp", "urn", "mailto", "file"}
+_WELL_KNOWN_PREFIXES: dict[str, str] = WELL_KNOWN_PREFIXES
+_IMPLICIT_PREFIXES: frozenset[str]   = IMPLICIT_PREFIXES
+_URI_SCHEMES: frozenset[str]         = URI_SCHEMES
 
 _PREFIX_USAGE_RE = re.compile(r'\b([a-zA-Z][a-zA-Z0-9_]*):[a-zA-Z]')
 
@@ -173,15 +197,45 @@ def _auto_fix_missing_prefixes(
 ) -> tuple[str, list[str]]:
     """Auto-fix missing prefix declarations in the YARRRML text.
 
+    Uses TWO detection strategies so that text-injected entries
+    (e.g. ``ex:hasActor`` added by the island-wirer) are ALWAYS caught
+    even when the parsed ``data`` dict is stale:
+
+      Strategy A — dict-based: scan the parsed YAML data structure.
+      Strategy B — text-based: scan the raw YARRRML string directly.
+
+    Both strategies contribute to the set of missing prefixes.
+
     Resolution order for each missing prefix:
       1. Ontology prefix declarations (pipeline's own ontology)
       2. Well-known prefix URI table
+      3. Synthetic fallback URI
 
     Returns
     -------
     (fixed_yarrrml, list_of_fix_descriptions)
     """
-    _, missing = _check_prefix_completeness(data)
+    # Strategy A: dict-based detection
+    _, missing_from_dict = _check_prefix_completeness(data) if data else ([], set())
+
+    # Strategy B: text-based detection (catches text-injected entries
+    # that are NOT yet reflected in the parsed ``data`` dict)
+    declared_in_text: set[str] = set()
+    if data and isinstance(data.get("prefixes"), dict):
+        declared_in_text = set(data["prefixes"].keys())
+    # Also extract declared prefixes directly from the text (more reliable)
+    for m in re.finditer(r'^\s{2}(\w+):\s+["\']?https?://', yarrrml_str, re.MULTILINE):
+        declared_in_text.add(m.group(1))
+
+    text_used: set[str] = set()
+    for m in _PREFIX_USAGE_RE.finditer(yarrrml_str):
+        prefix = m.group(1)
+        if prefix.lower() not in _URI_SCHEMES:
+            text_used.add(prefix)
+    missing_from_text = text_used - declared_in_text - _IMPLICIT_PREFIXES
+
+    # Combined missing set
+    missing = missing_from_dict | missing_from_text
     if not missing:
         return yarrrml_str, []
 
@@ -196,12 +250,14 @@ def _auto_fix_missing_prefixes(
     additions: list[str] = []
     for prefix in sorted(missing):
         uri = available.get(prefix)
-        if uri:
-            additions.append(f'  {prefix}: "{uri}"')
-            fixes.append(f"Added missing prefix '{prefix}: {uri}'")
+        if not uri:
+            # Permanent fallback: synthesize a URI for any completely unknown prefix.
+            # This makes the fix dataset-agnostic — no manual prefix registry needed.
+            uri = f"http://example.org/{prefix}/"
+            print(f"    [WARN] Unknown prefix '{prefix}' — assigned synthetic URI <{uri}>")
+        additions.append(f'  {prefix}: "{uri}"')
+        fixes.append(f"Added missing prefix '{prefix}: {uri}'")
 
-    if not additions:
-        return yarrrml_str, []
 
     # Insert new prefix lines right after the `prefixes:` line
     lines = yarrrml_str.split('\n')
@@ -662,28 +718,41 @@ def _auto_fix_redundancy(
     changed = False
 
     for (pred, col), mnames in sorted(redundant.items()):
-        # Determine which mapping should KEEP the property:
-        # 1. If the predicate "belongs" to a mapping's class (heuristic),
-        #    keep it there.
-        # 2. Otherwise fall back to the NON-primary mapping (secondary
-        #    mappings are more semantically specific).
-        # 3. Last resort: primary.
+        # Determine which mapping should KEEP the property.
+        # Priority order (agnostic):
+        #   1. A mapping that has a 2-item IRI entry for this predicate
+        #      (IRI reference > literal — fixes Bug 3).
+        #   2. Semantic ownership via class-name heuristic.
+        #   3. Non-primary mapping (more semantically specific).
+        #   4. Primary mapping as last resort.
         keep_mapping = None
 
-        # Heuristic: check if predicate local name suggests ownership
-        pred_local = pred.rsplit(":", 1)[-1].lower() if ":" in pred else pred.lower()
+        # Check for IRI-typed entry: prefer the mapping that has [pred, val~iri]
         for mname in sorted(mnames):
-            cls_hint = mapping_class_hints.get(mname, "")
-            # e.g. PersonMapping has class "person", predicate "givenName"
-            # → schema predicates belong with Person, not Transaction
-            if cls_hint and cls_hint != "":
-                # If mapping name contains the class hint, it's a match
+            mdef = mappings.get(mname)
+            if not isinstance(mdef, dict):
+                continue
+            for entry in (mdef.get("po") or []):
+                if (isinstance(entry, list) and len(entry) == 2
+                        and str(entry[0]) == pred
+                        and f"$({col})" in str(entry[1])):
+                    # 2-item entry with this column — it's an IRI reference
+                    keep_mapping = mname
+                    break
+            if keep_mapping:
+                break
+
+        # Heuristic: check if predicate local name suggests class ownership
+        if keep_mapping is None:
+            pred_local = pred.rsplit(":", 1)[-1].lower() if ":" in pred else pred.lower()
+            for mname in sorted(mnames):
+                cls_hint = mapping_class_hints.get(mname, "")
                 mname_lower = mname.lower()
-                if cls_hint in mname_lower and mname != primary:
+                if cls_hint and cls_hint in mname_lower and mname != primary:
                     keep_mapping = mname
                     break
 
-        # If no semantic match, keep in the NON-primary (more specific) mapping
+        # Fall back to non-primary (more specific)
         if keep_mapping is None:
             non_primary = sorted(m for m in mnames if m != primary)
             keep_mapping = non_primary[0] if non_primary else primary
@@ -892,6 +961,102 @@ def _auto_fix_metadata_class(
         return yarrrml_str, []
 
 
+def _fix_predicate_separator_typo(
+    yarrrml_str: str,
+    declared_prefixes: set[str],
+) -> tuple[str, list[str]]:
+    """Fix predicates that use '#' instead of ':' as prefix separator.
+
+    e.g.  ex#acarboseStatus  →  ex:acarboseStatus
+
+    When the LLM accidentally writes 'ex#localname' in a po entry,
+    Yatter accepts it as valid YAML but morph-KGC translates it to a
+    Literal term-type instead of an IRI, causing:
+       "Found an invalid predicate termtype [..., rr:Literal].
+        Predicate maps must be rr:IRI."
+
+    Fix is applied only when the prefix part matches a declared prefix
+    (or a known short-form prefix) so we don't mangle full URIs like
+    <http://example.org/fraud#Class>.
+
+    Fully agnostic — driven by the prefix declarations in the mapping.
+    """
+    if not yarrrml_str or not declared_prefixes:
+        return yarrrml_str, []
+
+    fixes: list[str] = []
+    # Build a pattern that matches declared_prefix#LocalName
+    # where LocalName starts with a capital or lowercase letter.
+    # We anchor to word boundaries and exclude patterns inside < >
+    # by only replacing outside angle-bracket-enclosed URIs.
+
+    def _replace(m: re.Match) -> str:
+        prefix = m.group(1)
+        local = m.group(2)
+        if prefix in declared_prefixes:
+            fixes.append(f"Fixed predicate separator: '{prefix}#{local}' -> '{prefix}:{local}'")
+            return f"{prefix}:{local}"
+        return m.group(0)
+
+    # Replace prefix#Local patterns that are NOT inside < ... >
+    # Strategy: split on angle-bracket sections, apply only outside them
+    result_parts: list[str] = []
+    # Split on <...> URIs to avoid touching full URIs
+    segments = re.split(r'(<[^>]+>)', yarrrml_str)
+    for seg in segments:
+        if seg.startswith('<') and seg.endswith('>'):
+            result_parts.append(seg)  # inside URI — skip
+        else:
+            seg = re.sub(
+                r'\b([A-Za-z][A-Za-z0-9_]*)#([A-Za-z][A-Za-z0-9_]*)\b',
+                _replace,
+                seg,
+            )
+            result_parts.append(seg)
+
+    return ''.join(result_parts), fixes
+
+
+def _fix_yaml_breaking_predicates(yarrrml_str: str) -> tuple[str, list[str]]:
+    """Fix predicate values in po: flow-list entries that contain spaces or
+    extra colons, causing YAML to parse them as dicts instead of strings.
+
+    The canonical case is a column named ``Unnamed: 0``:
+        - [ex:Unnamed: 0, $(Unnamed: 0), xsd:string]
+    YAML parses ``ex:Unnamed: 0`` as the dict ``{ex:Unnamed: 0}`` which
+    causes Yatter to crash with "dict object has no attribute 'startswith'".
+
+    Fix: replace spaces with underscores in the predicate (first item of
+    each flow-list po: entry).  The column reference $(Unnamed: 0) is
+    left untouched — Yatter accepts those.
+
+    This is fully agnostic — works for any column name with spaces/colons.
+    """
+    fixes: list[str] = []
+    lines = yarrrml_str.split("\n")
+    result: list[str] = []
+    for line in lines:
+        # Match flow-list po entries: - [predicate, ...]
+        m = re.match(r'^(\s*-\s*\[)([^\[,]+?)(,.+)$', line)
+        if m:
+            indent_and_bracket = m.group(1)
+            predicate = m.group(2)
+            rest = m.group(3)
+            # Sanitise only if predicate has space or extra colons (more than prefix:local)
+            # A valid predicate is prefix:localName with no spaces
+            if " " in predicate or predicate.count(":") > 1:
+                safe_pred = re.sub(r'\s+', '_', predicate.strip())
+                # Remove extra colons beyond the first (prefix:local:extra → prefix:local_extra)
+                parts = safe_pred.split(":")
+                if len(parts) > 2:
+                    safe_pred = parts[0] + ":" + "_".join(parts[1:])
+                if safe_pred != predicate.strip():
+                    fixes.append(f"Sanitised predicate: '{predicate.strip()}' → '{safe_pred}'")
+                    line = f"{indent_and_bracket}{safe_pred}{rest}"
+        result.append(line)
+    return "\n".join(result), fixes
+
+
 def _auto_fix_intra_mapping_duplicates(
     yarrrml_str: str,
     data: dict,
@@ -1024,8 +1189,92 @@ def _check_class_validity(mappings: dict, ontology_raw: str) -> list[str]:
 
 
 # ────────────────────────────────────────────────────────────────────
-# Auto-inject missing columns (deterministic, fully agnostic)
+# Dataset-agnostic column fallback rules (Fix 2 + Fix 4)
 # ────────────────────────────────────────────────────────────────────
+
+# Evaluated in ORDER — first match wins.
+COLUMN_FALLBACK_RULES: list[tuple[str, str, str]] = [
+    # Index / row-number artifacts
+    (r'^unnamed:\s*\d+$',                                       'ex:rowIndex',         'xsd:integer'),
+    (r'^index$',                                                'ex:rowIndex',         'xsd:integer'),
+    # Geographic coordinates
+    (r'(lat|latitude)$',                                        'geo:lat',             'xsd:decimal'),
+    (r'(lon|long|longitude)$',                                  'geo:long',            'xsd:decimal'),
+    # Full date-time / timestamp  (match BEFORE bare date/time)
+    (r'date.*time|datetime|timestamp|trans_date',               'ex:dateTime',         'xsd:dateTime'),
+    (r'_date_.*|.*_time_.*',                                    'ex:dateTime',         'xsd:dateTime'),
+    # Bare date / time suffixes
+    (r'(^date$|_date$)',                                        'ex:date',             'xsd:date'),
+    (r'(^time$|_time$)',                                        'ex:time',             'xsd:dateTime'),
+    (r'created_at|updated_at',                                  'schema:dateModified', 'xsd:dateTime'),
+    # Numeric amounts
+    (r'(amt|amount|price|cost|fee|salary|revenue|total|balance)$', None,              'xsd:decimal'),
+    # Integer / counts
+    (r'(pop|population|count|num|age|year|qty|quantity|rank|score)$', None,           'xsd:integer'),
+    # Booleans
+    (r'^is_|^has_|_flag$|_bool$',                               None,                 'xsd:boolean'),
+    # Identifiers
+    (r'^id$|_id$',                                              'ex:identifier',       'xsd:string'),
+    (r'^uuid$|^guid$',                                          'ex:uuid',             'xsd:string'),
+]
+
+
+def get_fallback_predicate(col_name: str) -> tuple[str, str] | None:
+    """Return (predicate, datatype) for columns the LLM tends to skip.
+
+    Driven entirely by column-name patterns — no dataset-specific knowledge.
+    Returns None if no rule matches (caller should use a safe default).
+    """
+    col_lower = col_name.lower().strip()
+    for pattern, predicate, datatype in COLUMN_FALLBACK_RULES:
+        if re.search(pattern, col_lower):
+            if predicate is None:
+                predicate = f"ex:{_to_camel_case(col_name)}"
+            return predicate, datatype
+    return None
+
+
+def _extract_missing_columns_from_feedback(feedback: str) -> list[str]:
+    """Parse column names from a COLUMN COVERAGE FAILURE feedback string."""
+    # Primary format: NOT referenced: [col1, col2, ...]
+    m = re.search(r'NOT referenced:\s*\[(.+?)\]', feedback)
+    if m:
+        return [c.strip().strip("'\"") for c in m.group(1).split(",") if c.strip()]
+    # WARN format from _build_column_assignment_hint
+    m = re.search(r'MISSING COLUMNS \(must be added\):\s*\[(.+?)\]', feedback)
+    if m:
+        return [c.strip().strip("'\"") for c in m.group(1).split(",") if c.strip()]
+    return []
+
+
+def _build_mandatory_column_injection(missing_cols: list[str]) -> str:
+    """Format missing columns as a mandatory fix block with concrete predicate suggestions."""
+    if not missing_cols:
+        return ""
+    lines = [
+        "⚠️ MANDATORY FIX — previous attempt REJECTED.",
+        "The following columns are MISSING and MUST be added to the mapping:",
+    ]
+    for col in missing_cols:
+        result = get_fallback_predicate(col)
+        if result:
+            pred, dtype = result
+            lines.append(f"  - '{col}' → suggested: [{pred}, $({col}), {dtype}]")
+        else:
+            lines.append(
+                f"  - '{col}' → suggested: [ex:{_to_camel_case(col)}, $({col}), xsd:string]"
+            )
+    lines += [
+        "",
+        "Rules:",
+        "- Every column in this list MUST appear in at least one mapping's po section.",
+        "- Do NOT skip columns just because they seem like metadata or index fields.",
+        "- For index-like columns (Unnamed: 0, index): use [ex:rowIndex, $(col), xsd:integer].",
+        "- For datetime columns: use [ex:dateTime, $(col), xsd:dateTime].",
+        "- When unsure, use [ex:hasValue, $(col), xsd:string] as a safe fallback.",
+    ]
+    return "\n".join(lines)
+
 
 def _auto_inject_missing_columns(
     yarrrml_str: str,
@@ -1070,7 +1319,7 @@ def _auto_inject_missing_columns(
         elif re.search(r'(lon|long|longitude)$', col_lower):
             pred, dtype = "geo:long", "xsd:decimal"
         elif re.search(r'(date|time|datetime|timestamp)$', col_lower):
-            pred, dtype = f"ex:{_to_camel_case(col)}", "xsd:string"
+            pred, dtype = f"ex:{_to_camel_case(col)}", "xsd:dateTime"
         elif re.search(r'(amt|amount|price|cost|fee|salary|revenue|total|balance)$', col_lower):
             pred, dtype = f"ex:{_to_camel_case(col)}", "xsd:decimal"
         elif re.search(r'(pop|population|count|num|age|year|qty|quantity|rank|score)$', col_lower):
@@ -1080,37 +1329,49 @@ def _auto_inject_missing_columns(
         else:
             pred, dtype = f"ex:{_to_camel_case(col)}", "xsd:string"
 
-        # ── Best-fit mapping by name-prefix similarity ──────────────
+        # ── Best-fit mapping: always prefer the primary (largest) mapping.
+        # The old name-similarity heuristic was picking small sub-mappings
+        # (e.g. MedicationRecord_insulin) for unrelated columns like
+        # admission_source_id — which is semantically wrong.
+        # Only override the primary when there is a strong semantic match:
+        # the column prefix exactly appears in a non-primary mapping name.
         target = primary
-        best_score = 0
-        col_prefix = col_lower[:5]
+        col_prefix = col_lower.replace("_", "")[:6]
         for mname in mappings:
-            score = 0
-            m_lower = mname.lower()
-            if col_prefix in m_lower:
-                score += 5
-            score += sum(1 for c in col_lower if c in m_lower)
-            if score > best_score:
-                best_score = score
+            if mname == primary:
+                continue
+            m_lower_clean = mname.lower().replace("_", "").replace("mapping", "")
+            # Only reassign if the column prefix is a substantial match
+            # (at least 5 chars overlap) and not a generic sub-mapping name
+            if len(col_prefix) >= 5 and col_prefix in m_lower_clean:
                 target = mname
+                break
 
         # ── Text-level injection after last po: entry of target ────
         new_entry = f"      - [{pred}, $({col}), {dtype}]"
         in_target = False
         last_po_idx = -1
 
+        in_po_section = False
         for i, line in enumerate(lines):
             # Detect start of the target mapping block (2-space indent)
             if re.match(rf'^ {{2}}{re.escape(target)}\s*:', line):
                 in_target = True
             if in_target:
-                # Track the last inline po list entry line
-                if re.match(r'^ {6}-\s+\[', line):
-                    last_po_idx = i
+                # Detect start of po: section
+                if re.match(r'^ {4}po\s*:', line):
+                    in_po_section = True
                 # Stop when we hit the next sibling mapping definition
-                elif i > 0 and re.match(r'^ {2}\w', line) and not re.match(
+                elif re.match(r'^ {2}\w', line) and not re.match(
                         rf'^ {{2}}{re.escape(target)}\s*:', line):
                     break
+                elif in_po_section:
+                    # Any line at 6+ spaces that is not blank belongs to po entries
+                    if re.match(r'^ {6}', line) and line.strip():
+                        last_po_idx = i
+                    # A 4-space key (like 's:', 'sources:') ends po section
+                    elif re.match(r'^ {4}\w', line):
+                        in_po_section = False
 
         if last_po_idx > 0:
             lines.insert(last_po_idx + 1, new_entry)
@@ -1118,7 +1379,26 @@ def _auto_inject_missing_columns(
         else:
             still_missing.append(col)
 
-    return "\n".join(lines), still_missing, fixes
+    result_yaml = "\n".join(lines)
+
+    # ── Restore hyphenated column names that the LLM underscore-ified ──
+    # e.g. $(metformin_pioglitazone) → $(metformin-pioglitazone)
+    all_csv_cols: set[str] = set()
+    # Collect from original missing_cols (these have real names)
+    all_csv_cols.update(missing_cols)
+    # Also from any columns already in mappings
+    for mdef in (mappings or {}).values():
+        if isinstance(mdef, dict):
+            for entry in (mdef.get("po") or []):
+                if isinstance(entry, list) and len(entry) >= 2:
+                    for ref in re.findall(r'\$\(([^)]+)\)', str(entry[1])):
+                        all_csv_cols.add(ref)
+    alias_map = build_column_alias_map(all_csv_cols)
+    if alias_map:
+        result_yaml, restore_fixes = restore_column_names(result_yaml, alias_map)
+        fixes.extend(restore_fixes)
+
+    return result_yaml, still_missing, fixes
 
 
 def _auto_fix_islands(
@@ -1241,9 +1521,216 @@ def _auto_fix_islands(
     return "\n".join(lines), fixes
 
 
-# ────────────────────────────────────────────────────────────────────
-# Main entry point
-# ────────────────────────────────────────────────────────────────────
+def _auto_drop_phantom_mappings(
+    yarrrml_str: str,
+    data: dict,
+    mappings: dict,
+    csv_columns: set[str],
+    ontology_raw: str = "",
+) -> tuple[str, list[str]]:
+    """Drop disconnected mappings that have NO explicit ontology support and
+    redistribute their orphaned columns to the primary mapping.
+
+    This is the fix for the "MetadataMapping always disconnected" runaway loop.
+    It is FULLY AGNOSTIC — it never hard-codes any mapping name or column name.
+
+    A mapping is considered a "phantom" (safe to drop) when ALL of these hold:
+    1. It is disconnected (neither referenced by another mapping, nor has outgoing
+       links to another mapping's subject).
+    2. No property in the ontology explicitly links TO a class whose name matches
+       the mapping's subject URI base.
+    3. It contributes NO columns that are not already mapped in the primary mapping
+       OR those unmapped columns can be trivially injected into the primary.
+
+    Returns (fixed_yarrrml, list_of_fix_descriptions).
+    Columns from dropped mappings are redistributed to the primary mapping.
+    """
+    if not mappings or len(mappings) <= 1:
+        return yarrrml_str, []
+
+    def _normalise(s: str) -> str:
+        s = re.sub(r'\$\([^)]+\)', '', s)
+        s = s.replace('~iri', '')
+        s = re.sub(r'/+', '/', s)
+        return s.rstrip('_/')
+
+    # ── Identify disconnected mappings (same logic as _check_islands) ──────
+    subject_bases: dict[str, str] = {}
+    for name, mdef in mappings.items():
+        if isinstance(mdef, dict):
+            base = _normalise(str(mdef.get("s", "") or ""))
+            if base:
+                subject_bases[name] = base
+
+    po_objs: dict[str, list[str]] = {
+        n: [_normalise(str(e[1])) for e in (m.get("po") or [])
+            if isinstance(e, list) and len(e) >= 2]
+        for n, m in mappings.items() if isinstance(m, dict)
+    }
+
+    disconnected: list[str] = []
+    for name, base in subject_bases.items():
+        referenced = any(
+            base in obj
+            for other, objs in po_objs.items()
+            if other != name for obj in objs
+        )
+        has_outgoing = any(
+            other_base and other_base in _normalise(str(e[1]))
+            for e in (mappings[name].get("po") or [])
+            if isinstance(e, list) and len(e) >= 2
+               and str(e[0]) not in ("a", "rdf:type")
+            for other, other_base in subject_bases.items()
+            if other != name
+        )
+        if not referenced and not has_outgoing:
+            disconnected.append(name)
+
+    if not disconnected:
+        return yarrrml_str, []
+
+    # ── Primary = most data-property po entries ──────────────────────────
+    data_prop_counts = {
+        n: sum(1 for e in (m.get("po") or [])
+               if isinstance(e, list) and len(e) >= 3
+               and str(e[0]) not in ("a", "rdf:type"))
+        for n, m in mappings.items() if isinstance(m, dict)
+    }
+    primary = sorted(data_prop_counts, key=lambda k: (-data_prop_counts[k], k))[0]
+
+    # ── Ontology property names (to check if a mapping has explicit support) ─
+    # Extract all property / class local names mentioned in the ontology text
+    ontology_terms: set[str] = set()
+    if ontology_raw:
+        for m in re.finditer(r'[#/]([A-Za-z][A-Za-z0-9_]*)(?=[>\s,;.])', ontology_raw):
+            ontology_terms.add(m.group(1).lower())
+
+    fixes: list[str] = []
+    lines = yarrrml_str.split("\n")
+
+    for island in disconnected:
+        if island == primary:
+            continue
+
+        mdef = mappings.get(island)
+        if not isinstance(mdef, dict):
+            continue
+
+        # ── Check if ontology explicitly defines a property for this mapping ──
+        # Extract the "semantic name" from the mapping name (strip Mapping/Meta suffixes)
+        clean_name = re.sub(r'(Mapping|Metadata|Map|Node)$', '', island)
+        clean_lower = clean_name.lower()
+
+        # If the ontology has a property whose local name includes the mapping's
+        # semantic name, keep the mapping (it has ontology justification).
+        has_ontology_support = any(
+            clean_lower in term or term in clean_lower
+            for term in ontology_terms
+            if len(term) > 3  # ignore trivial short tokens
+        )
+        if has_ontology_support and clean_lower not in ("metadata", "meta", "info"):
+            # Skip — don't drop mappings the ontology explicitly supports
+            continue
+
+        # ── Collect columns from the phantom mapping ──────────────────────
+        phantom_cols: list[tuple[str, str, str]] = []  # (predicate, col, dtype)
+        phantom_iri_links: list[tuple[str, str]] = []   # (predicate, iri_value)
+
+        for entry in (mdef.get("po") or []):
+            if not isinstance(entry, list):
+                continue
+            pred = str(entry[0])
+            if pred in ("a", "rdf:type"):
+                continue
+            if len(entry) == 3:
+                # data property: [pred, $(col), dtype]
+                cols_in_val = re.findall(r'\$\(([^)]+)\)', str(entry[1]))
+                for c in cols_in_val:
+                    if c in csv_columns:
+                        phantom_cols.append((pred, c, str(entry[2])))
+            elif len(entry) == 2:
+                # could be an IRI link or a bare column reference
+                val = str(entry[1])
+                if '~iri' in val and not val.startswith('$('):
+                    phantom_iri_links.append((pred, val))
+                else:
+                    cols_in_val = re.findall(r'\$\(([^)]+)\)', val)
+                    for c in cols_in_val:
+                        if c in csv_columns:
+                            phantom_cols.append((pred, c, "xsd:string"))
+
+        # ── What columns are already in the primary mapping? ──────────────
+        primary_cols: set[str] = set()
+        for entry in (mappings[primary].get("po") or []):
+            if isinstance(entry, list) and len(entry) >= 2:
+                for c in re.findall(r'\$\(([^)]+)\)', str(entry[1])):
+                    primary_cols.add(c)
+        subj_cols = set(re.findall(r'\$\(([^)]+)\)', str(mappings[primary].get("s", ""))))
+        primary_cols |= subj_cols
+
+        # Orphaned columns = unique to the phantom mapping (not in primary)
+        orphaned = [(p, c, d) for p, c, d in phantom_cols if c not in primary_cols]
+
+        # ── Drop the phantom mapping from the YARRRML text ────────────────
+        # Strategy: find the mapping's block boundaries and remove them.
+        new_lines: list[str] = []
+        in_block = False
+        skip_next_blank = False
+        for i, line in enumerate(lines):
+            # Detect start of this mapping's block
+            if re.match(rf'^ {{2}}{re.escape(island)}\s*:', line):
+                in_block = True
+                skip_next_blank = True
+                continue
+            if in_block:
+                # Block ends when we hit the next sibling mapping at 2-space indent
+                if re.match(r'^ {2}\w', line) and not line.strip().startswith('#'):
+                    in_block = False
+                    # Keep this line — it's the start of the next mapping
+                    new_lines.append(line)
+                    continue
+                # Skip all lines in the phantom block
+                continue
+            if skip_next_blank and not line.strip():
+                skip_next_blank = False
+                continue
+            new_lines.append(line)
+
+        lines = new_lines
+        fixes.append(f"Dropped phantom mapping '{island}' (disconnected, no ontology support)")
+
+        # ── Inject orphaned columns into primary mapping ──────────────────
+        if orphaned:
+            # Find last po entry in the primary mapping in the updated lines
+            in_primary = False
+            last_po_idx = -1
+            for i, line in enumerate(lines):
+                if re.match(rf'^ {{2}}{re.escape(primary)}\s*:', line):
+                    in_primary = True
+                if in_primary:
+                    if re.match(r'^ {6}-\s+\[', line):
+                        last_po_idx = i
+                    elif i > 0 and re.match(r'^ {2}\w', line) and not re.match(
+                            rf'^ {{2}}{re.escape(primary)}\s*:', line):
+                        break
+
+            if last_po_idx > 0:
+                insert_lines = []
+                for pred, col, dtype in orphaned:
+                    insert_lines.append(f"      - [{pred}, $({col}), {dtype}]")
+                for j, il in enumerate(insert_lines):
+                    lines.insert(last_po_idx + 1 + j, il)
+                fixes.append(
+                    f"Redistributed {len(orphaned)} orphaned column(s) from "
+                    f"'{island}' → '{primary}': "
+                    f"{[c for _, c, _ in orphaned]}"
+                )
+
+    if not fixes:
+        return yarrrml_str, []
+
+    return "\n".join(lines), fixes
+
 
 def call_refiner_llm(state: AgentState) -> dict:
     """Three-phase refinement:
@@ -1316,6 +1803,20 @@ def call_refiner_llm(state: AgentState) -> dict:
                 print(f"    [CLEAN] Removed {len(removed)} unused prefix(es): {removed}")
                 yarrrml = cleaned
                 data = cleaned_data
+                if isinstance(data.get("mappings"), dict):
+                    mappings = data["mappings"]
+
+        # ── Fix predicate separator typos: ex#local → ex:local ────
+        _declared_pfx = set(data.get("prefixes", {}).keys()) if data.get("prefixes") else set()
+        _declared_pfx.update(_IMPLICIT_PREFIXES)
+        sep_fixed, sep_fixes = _fix_predicate_separator_typo(yarrrml, _declared_pfx)
+        if sep_fixes:
+            sep_data = _parse_yarrrml(sep_fixed)
+            if sep_data:
+                for fix in sep_fixes:
+                    print(f"    [FIX] {fix}")
+                yarrrml = sep_fixed
+                data = sep_data
                 if isinstance(data.get("mappings"), dict):
                     mappings = data["mappings"]
 
@@ -1405,9 +1906,38 @@ def call_refiner_llm(state: AgentState) -> dict:
                     mappings = fixed_data["mappings"]
                     # Re-check — if islands are resolved, don't report them
                     remaining_islands = _check_islands(mappings)
+                    # ── If islands persist, try dropping phantom mappings ──
+                    if remaining_islands:
+                        fixed_yarrrml2, drop_fixes = _auto_drop_phantom_mappings(
+                            yarrrml, data, mappings, csv_columns, ontology_raw
+                        )
+                        if drop_fixes:
+                            fixed_data2 = _parse_yarrrml(fixed_yarrrml2)
+                            if fixed_data2 and isinstance(fixed_data2.get("mappings"), dict):
+                                for fix in drop_fixes:
+                                    print(f"    [FIX] Phantom-drop: {fix}")
+                                yarrrml = fixed_yarrrml2
+                                data = fixed_data2
+                                mappings = fixed_data2["mappings"]
+                                remaining_islands = _check_islands(mappings)
                     all_errors.extend(remaining_islands)
             else:
-                all_errors.extend(_check_islands(mappings))
+                # No wiring fix found — try phantom-drop directly
+                fixed_yarrrml2, drop_fixes = _auto_drop_phantom_mappings(
+                    yarrrml, data, mappings, csv_columns, ontology_raw
+                )
+                if drop_fixes:
+                    fixed_data2 = _parse_yarrrml(fixed_yarrrml2)
+                    if fixed_data2 and isinstance(fixed_data2.get("mappings"), dict):
+                        for fix in drop_fixes:
+                            print(f"    [FIX] Phantom-drop: {fix}")
+                        yarrrml = fixed_yarrrml2
+                        data = fixed_data2
+                        mappings = fixed_data2["mappings"]
+                        remaining_islands = _check_islands(mappings)
+                        all_errors.extend(remaining_islands)
+                else:
+                    all_errors.extend(_check_islands(mappings))
 
     # Merge current + previous conflict columns
     all_conflict_cols = current_conflict_cols | prev_conflict_cols
@@ -1436,10 +1966,6 @@ def call_refiner_llm(state: AgentState) -> dict:
             empty_cols = _detect_empty_columns(csv_path)
             if empty_cols:
                 missing = [c for c in missing if c not in empty_cols]
-        # Ignore auto-generated index columns (e.g. "Unnamed: 0")
-        if missing:
-            missing = [c for c in missing
-                       if not c.startswith("Unnamed:") and c.lower() not in ("index",)]
         if missing:
             # ── Auto-inject before burning an LLM retry ────────
             yarrrml, missing, inject_fixes = _auto_inject_missing_columns(
@@ -1502,6 +2028,34 @@ def call_refiner_llm(state: AgentState) -> dict:
     # ── Phase 2: LLM-based semantic / URI-logic review ────────
     # Skip Phase 2 if all issues were handled deterministically
     auto_fixes_applied = yarrrml != original_yarrrml
+
+    # ── Always apply column-name restoration before returning ──
+    # Fixes: LLM silently converts 'metformin-pioglitazone' → 'metformin_pioglitazone'
+    # in YARRRML templates. Restore using actual CSV column names.
+    if csv_columns:
+        _alias_map = build_column_alias_map(csv_columns)
+        if _alias_map:
+            yarrrml, _restore_fixes = restore_column_names(yarrrml, _alias_map)
+            for _fix in _restore_fixes:
+                print(f"    [FIX] {_fix}")
+            if _restore_fixes:
+                auto_fixes_applied = True
+
+    # ── FINAL prefix pass — must run LAST, after island-wiring and
+    #    column-injection which can introduce new prefix usages (e.g.
+    #    ex:hasActor, ex:category).  Without this pass those usages
+    #    would never get a declaration and yatter silently returns None.
+    _final_data = _parse_yarrrml(yarrrml) or data
+    _ontology_raw = state.get("ontology_info", {}).get("raw", "")
+    _entity_plan  = state.get("schema_alignment", {}).get("entity_plan", "")
+    yarrrml, _final_pfx_fixes = _auto_fix_missing_prefixes(
+        yarrrml, _final_data, _ontology_raw, _entity_plan
+    )
+    if _final_pfx_fixes:
+        for _f in _final_pfx_fixes:
+            print(f"    [FIX] Final-prefix-pass: {_f}")
+        auto_fixes_applied = True
+
     if auto_fixes_applied and not all_errors:
         print("    [Refiner] All issues auto-fixed deterministically — skipping LLM phase.")
         return {

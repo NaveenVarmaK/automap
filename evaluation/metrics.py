@@ -187,6 +187,9 @@ def evaluate(
     if 3 in levels:
         metrics.update(level3_column_coverage(pipeline_result))
 
+    # Always compute CQ coverage when sparql_validation_results are present
+    metrics.update(level4_cq_coverage(pipeline_result))
+
     return metrics
 
 
@@ -477,6 +480,48 @@ def level3_column_coverage(
 
 
 # ────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# Level 4 – CQ / SPARQL Validation Coverage
+# ────────────────────────────────────────────────────────────────────
+
+def level4_cq_coverage(result: dict[str, Any]) -> dict[str, Any]:
+    """Compute CQ validation coverage from sparql_validation_results.
+
+    Treats null results (SPARQL generation errors) as failures so the
+    reported coverage is conservative and honest.
+
+    Metrics produced
+    ----------------
+    L4_cq_total       : int   — total CQs attempted
+    L4_cq_passed      : int   — ASK returned true
+    L4_cq_failed      : int   — ASK returned false
+    L4_cq_error       : int   — SPARQL could not be generated / executed
+    L4_cq_coverage    : float — passed / total (0.0 if no CQs)
+    L4_cq_skipped     : bool
+    """
+    sparql_results = result.get("sparql_validation_results", [])
+    if not sparql_results:
+        return {"L4_cq_skipped": True}
+
+    n_passed = sum(1 for r in sparql_results if r.get("passed") is True)
+    n_failed = sum(1 for r in sparql_results if r.get("passed") is False)
+    n_error  = sum(1 for r in sparql_results if r.get("passed") is None)
+    n_total  = len(sparql_results)
+
+    # null counts as failure for coverage calculation (conservative)
+    effective_pass = n_passed
+    effective_total = n_total
+
+    return {
+        "L4_cq_skipped": False,
+        "L4_cq_total": n_total,
+        "L4_cq_passed": n_passed,
+        "L4_cq_failed": n_failed,
+        "L4_cq_error": n_error,
+        "L4_cq_coverage": round(effective_pass / effective_total, 4) if effective_total else 0.0,
+    }
+
+
 # Pretty-print helper (for terminal / main.py)
 # ────────────────────────────────────────────────────────────────────
 
@@ -567,6 +612,16 @@ def print_metrics(metrics: dict[str, Any], levels: list[int]) -> None:
             temp = metrics.get(f"{role}_temperature")
             if model:
                 print(f"  [MODEL] {role}: {model}  (temp={temp})")
+
+    # CQ coverage (always shown if data present)
+    if not metrics.get("L4_cq_skipped"):
+        print("\n── Level 4: CQ / SPARQL Validation Coverage ──")
+        _print_kv("Total CQs", metrics.get("L4_cq_total"))
+        _print_kv("Passed", metrics.get("L4_cq_passed"))
+        _print_kv("Failed", metrics.get("L4_cq_failed"))
+        if metrics.get("L4_cq_error", 0):
+            _print_kv("Errors (SPARQL gen failed)", metrics.get("L4_cq_error"))
+        _print_kv("Coverage", metrics.get("L4_cq_coverage"))
 
     print()
 

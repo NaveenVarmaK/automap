@@ -229,6 +229,65 @@ Do NOT create 20+ po entries with duplicate predicates like `ex:drugName`.
 """
 
 # ────────────────────────────────────────────────────────────────────
+# COMPACT ONE-SHOT EXAMPLE — ~50% smaller.
+# Covers all key patterns: primary entity, FK-target entity, URI links.
+# Use when context is limited (< 8k tokens available for system prompt).
+# ────────────────────────────────────────────────────────────────────
+
+YARRRML_COMPACT_EXAMPLE = """\
+prefixes:
+  onto: "http://example.org/ontology#"
+  terms: "http://purl.org/dc/terms/"
+  xsd: "http://www.w3.org/2001/XMLSchema#"
+
+mappings:
+  # PRIMARY: content + IRI links + link TO related FK-target entities
+  OrderMapping:
+    sources:
+      - [orders.csv~csv]
+    s: onto:Order/$(order_id)
+    po:
+      - [a, onto:Order]
+      - [terms:description, $(notes), xsd:string]
+      - [onto:quantity, $(qty), xsd:integer]
+      - [onto:price, $(amount), xsd:decimal]
+      - [onto:orderDate, $(date), xsd:dateTime]
+      # FK link via URI template (NOT a literal, NOT a join)
+      - [onto:placedBy, onto:Customer/$(customer_id)~iri]
+      # Column that already holds a full URL → direct ~iri
+      - [terms:source, $(source_url)~iri]
+
+  # SEPARATE mapping for the FK-target entity (CustomerID references this)
+  CustomerMapping:
+    sources:
+      - [orders.csv~csv]
+    s: onto:Customer/$(customer_id)
+    po:
+      - [a, onto:Customer]
+      - [terms:identifier, $(customer_id), xsd:string]
+      - [onto:name, $(customer_name), xsd:string]
+      - [onto:country, $(country), xsd:string]
+"""
+
+# ────────────────────────────────────────────────────────────────────
+# CONDENSED GOLDEN RULES — 8 core rules, ~60% smaller than GOLDEN_RULES.
+# ────────────────────────────────────────────────────────────────────
+
+GOLDEN_RULES_SHORT = """\
+### CRITICAL RULES (violations crash the pipeline)
+R1 TEMPLATES>JOINS: Same-CSV FK → `[pred, prefix:Class/$(fk)~iri]`. NEVER joins.
+R2 NAMESPACE: `s: prefix:ClassName/$(id)` — use ontology prefix, NEVER http://example.com/.
+R3 OBJECT PROPS: If ontology ObjectProperty has range=B → create separate mapping for B.
+   In referencing mapping: `[pred, prefix:B/$(fk_col)~iri]`. NEVER a literal xsd:string.
+R4 IRI COLS: Full-URL column → `[pred, $(col)~iri]`. Text/codes → `[pred, $(col), xsd:type]`.
+R5 DISTRIBUTE: Multiple mappings get DIFFERENT properties. Do NOT copy all columns everywhere.
+R6 FLOW-STYLE: ALL po entries MUST be `- [pred, val, type]`. No block YAML style.
+R7 ~iri SYNTAX: CORRECT: `prefix:Class/$(col)~iri`.  WRONG: bare `$(col)~iri` with no path.
+R8 FK IDs: Cols ending in ID/Id/_id (e.g. CustomerID, ProductID) that are NOT the PK
+   → create a separate mapping AND link via `[pred, prefix:Class/$(fkCol)~iri]`.
+"""
+
+# ────────────────────────────────────────────────────────────────────
 # ROLE-SPECIFIC EXCERPTS
 # ────────────────────────────────────────────────────────────────────
 
@@ -244,20 +303,19 @@ Below is a complete, valid YARRRML file.  Focus on the `prefixes:` block format:
 ```
 """
 
+# Entity builder uses the COMPACT example + SHORT rules to stay within
+# the model's context window (full example + full rules = ~15 k tokens
+# which exceeds an 11 k n_ctx and crashes the pipeline).
 EXAMPLE_FOR_ENTITY_BUILDER = f"""\
 ### YARRRML SYNTAX REFERENCE (one-shot example)
-Study the example carefully — notice how properties are DISTRIBUTED:
-- Primary gets content properties + IRI links + link TO metadata.
-- Metadata gets administrative properties (title, subject, jurisdiction).
-- Parent gets parent_* columns + inverse link.
-- The SAME column CAN use DIFFERENT predicates in different mappings.
-- Primary links TO metadata — metadata does NOT link to itself.
+Key patterns: separate mapping for every FK-target entity; URI template
+for object-property links (NOT joins, NOT literals); flow-style po entries.
 
 ```yaml
-{YARRRML_FULL_EXAMPLE}
+{YARRRML_COMPACT_EXAMPLE}
 ```
 
-{GOLDEN_RULES}
+{GOLDEN_RULES_SHORT}
 """
 
 EXAMPLE_FOR_RELATIONSHIP_LINKER = f"""\
@@ -265,18 +323,17 @@ EXAMPLE_FOR_RELATIONSHIP_LINKER = f"""\
 Focus on linking patterns:
 
 **Same-CSV linking (ALWAYS use URI templates, NEVER joins):**
-- Metadata link (from PRIMARY):  `[onto:metadata, prefix:Class/$(id)/Metadata~iri]`
-- Parent link (from PRIMARY):    `[onto:isPartOf, prefix:Class/$(parent_id)~iri]`
-- Inverse link (from PARENT):    `[onto:hasPart, prefix:Class/$(id)~iri]`
-- IRI column (full URL):         `[predicate, $(column)~iri]`
+- FK entity link:  `[onto:placedBy, prefix:Class/$(fk)~iri]`
+- Metadata link:   `[onto:metadata, prefix:Class/$(id)/Metadata~iri]`
+- IRI column:      `[predicate, $(column)~iri]`
 
-**Link direction:** PRIMARY → Metadata (never Metadata → itself)
+**Link direction:** PRIMARY → related entities (never reverse self-links)
 
 ```yaml
-{YARRRML_FULL_EXAMPLE}
+{YARRRML_COMPACT_EXAMPLE}
 ```
 
-{GOLDEN_RULES}
+{GOLDEN_RULES_SHORT}
 """
 
 EXAMPLE_FOR_YARRRML_ARCHITECT = f"""\
@@ -284,8 +341,8 @@ EXAMPLE_FOR_YARRRML_ARCHITECT = f"""\
 Your output MUST follow the same format and property distribution pattern.
 
 ```yaml
-{YARRRML_FULL_EXAMPLE}
+{YARRRML_COMPACT_EXAMPLE}
 ```
 
-{GOLDEN_RULES}
+{GOLDEN_RULES_SHORT}
 """

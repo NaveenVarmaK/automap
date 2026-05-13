@@ -2,10 +2,12 @@ from tools.rml_tools import get_csv_schema, get_ontology_subgraph
 from agents.schema_agent import call_schema_llm
 from agents.mapper_agent import call_mapper_llm
 from agents.schema_alignment_agent import call_schema_alignment_agent
-from agents.cq_validator_agent import call_cq_validator_agent
+from agents.cq_to_sparql_agent import batch_cq_to_sparql, extract_yarrrml_prefixes, extract_yarrrml_mapping_context, probe_kg_types_and_predicates, build_kg_grounding_block
+from agents.cq_generator_agent import generate_cqs
 from agents.yarrrml_coordinator import coordinate_yarrrml_generation
 from data.checkpoints import AgentState
-from agents.refiner_agent import call_refiner_llm
+from agents.refiner_agent import call_refiner_llm, build_column_alias_map, restore_column_names
+from config.prefixes import WELL_KNOWN_PREFIXES
 from datetime import datetime
 
 import yaml as pyyaml   # PyYAML for normalisation
@@ -15,6 +17,102 @@ import os
 import re
 
 import morph_kgc
+
+
+# ────────────────────────────────────────────────────────────────────
+# RML prefix safety-net
+# ────────────────────────────────────────────────────────────────────
+
+# URI schemes that must not be treated as prefixes when scanning RML
+_RML_URI_SCHEMES = {"http", "https", "ftp", "urn", "mailto", "file"}
+
+# Tokens used as keywords in Turtle/RML — never real prefixes
+_TURTLE_KEYWORDS = {
+    "a", "true", "false", "BASE", "PREFIX",
+    "rr", "rml", "ql", "fnml", "fno",   # always emitted by yatter itself
+}
+
+# Well-known prefix → URI for RML-level auto-resolution.
+# Imported from config/prefixes.py (single source of truth).
+# NOTE: Do NOT add dataset-specific prefixes here (e.g. lkg, podio).
+#       Those are declared in the ontology and auto-detected from YARRRML.
+_RML_WELL_KNOWN_PREFIXES: dict[str, str] = dict(WELL_KNOWN_PREFIXES)
+
+_RML_PREFIX_USAGE_RE = re.compile(r'\b([a-zA-Z][a-zA-Z0-9_]*):[a-zA-Z_]')
+
+
+def _inject_missing_rml_prefixes(yarrrml_data: dict, rml_content: str,
+                                  yarrrml_text: str = "") -> str:
+    """Guarantee that every prefix used in the RML/Turtle output has a
+    corresponding ``@prefix`` declaration before morph_kgc parses it.
+
+    Two-pass strategy:
+      1. Collect prefixes *declared* in the original YARRRML ``prefixes:`` block
+         (yatter may have silently dropped some).  Also scan the raw YARRRML
+         text for declared prefixes (catches any that were text-injected and
+         not yet reflected in the parsed ``yarrrml_data`` dict).
+      2. Scan the *RML Turtle text* for ``prefix:localname`` patterns that have
+         no ``@prefix`` declaration.
+
+    Resolution order for unknown prefixes:
+      a. YARRRML ``prefixes:`` block  →  use declared URI
+      b. ``_RML_WELL_KNOWN_PREFIXES`` table  →  use canonical URI
+      c. Fallback  →  synthesize ``http://example.org/{prefix}/``
+
+    This makes the fix fully dataset-agnostic and permanent.
+    """
+    if not rml_content:
+        return rml_content
+
+    # --- Pass 1a: declared in YARRRML data dict ---
+    yarrrml_prefixes: dict[str, str] = {}
+    if yarrrml_data:
+        yarrrml_prefixes = {k: v for k, v in (yarrrml_data.get("prefixes") or {}).items()}
+
+    # --- Pass 1b: declared in YARRRML text (more robust — catches text-injected entries) ---
+    if yarrrml_text:
+        for m in re.finditer(r'^\s{2}(\w+):\s+"?(https?://[^"\s]+)"?', yarrrml_text, re.MULTILINE):
+            name, uri = m.group(1), m.group(2)
+            if name not in yarrrml_prefixes:
+                yarrrml_prefixes[name] = uri
+
+    # --- Pass 2: used in RML Turtle but never declared at all ---
+    existing_declared = set(re.findall(r'@prefix\s+(\w+)\s*:', rml_content))
+
+    used_in_rml: set[str] = set()
+    for m in _RML_PREFIX_USAGE_RE.finditer(rml_content):
+        p = m.group(1)
+        if p.lower() not in _RML_URI_SCHEMES and p not in _TURTLE_KEYWORDS:
+            used_in_rml.add(p)
+
+    # Combine: anything declared in YARRRML but absent from RML, plus
+    # anything used in RML but missing a @prefix declaration
+    need_injection = (set(yarrrml_prefixes.keys()) | used_in_rml) - existing_declared
+
+    if not need_injection:
+        return rml_content
+
+    # Build a resolution map: YARRRML declarations > well-known > synthetic
+    resolution: dict[str, str] = dict(_RML_WELL_KNOWN_PREFIXES)
+    resolution.update(yarrrml_prefixes)   # YARRRML declarations win
+
+    missing_lines: list[str] = []
+    for prefix in sorted(need_injection):
+        uri = resolution.get(prefix)
+        if not uri:
+            uri = f"http://example.org/{prefix}/"
+            print(f"    [RML-FIX] Unknown prefix '{prefix}' — synthesized URI <{uri}>")
+        else:
+            if not uri.endswith(("/", "#")):
+                uri = uri + "/"
+        missing_lines.append(f"@prefix {prefix}: <{uri}> .")
+        print(f"    [RML-FIX] Injected @prefix {prefix}: <{uri}>")
+
+    injection = "\n".join(missing_lines) + "\n"
+    first_prefix = rml_content.find("@prefix")
+    if first_prefix >= 0:
+        return rml_content[:first_prefix] + injection + rml_content[first_prefix:]
+    return injection + rml_content
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -221,6 +319,73 @@ def mapper_agent_node(state):
     }
 
 
+def generate_cqs_node(state):
+    """Auto-generate Competency Questions when the user has not provided any.
+
+    If the user already provided CQs (via --cqs) this node is a no-op —
+    their CQs are used as-is.  Auto-generated CQs are stored in
+    ``generated_cqs`` (separate from ``competency_questions``) so the
+    pipeline always knows which came from the user.
+
+    Either way, the active CQ list is saved to <run_dir>/cqs.txt so it
+    is always clear which questions were used in this run.
+    """
+    run_dir = state.get("run_dir", "data/output/debug")
+    user_cqs = state.get("competency_questions", [])
+
+    if user_cqs:
+        _log_section("CQ Generator")
+        print(f"  Using {len(user_cqs)} user-provided CQ(s) — skipping auto-generation.")
+        for i, cq in enumerate(user_cqs, 1):
+            print(f"    [{i}] {cq}")
+        _save_cqs_to_file(user_cqs, run_dir, source="user-provided")
+        return {
+            "generated_cqs": [],
+            "messages": [f"CQ Generator: Using {len(user_cqs)} user-provided CQ(s)."],
+        }
+
+    _log_section("CQ Generator")
+    print("  No CQs provided — auto-generating from schema + ontology ...")
+
+    # Pass the entity plan (built by align_schema before this node) so
+    # the CQ generator is grounded to actual entity types in the KG.
+    entity_plan = state.get("schema_alignment", {}).get("entity_plan", "")
+
+    cqs = generate_cqs(
+        schema_info=state.get("schema_info", {}),
+        ontology_info=state.get("ontology_info", {}),
+        base_uri=state.get("base_uri", "http://example.org/"),
+        entity_plan=entity_plan if entity_plan else None,
+    )
+
+    if cqs:
+        print(f"  [OK] Generated {len(cqs)} CQ(s):")
+        for i, cq in enumerate(cqs, 1):
+            print(f"    [{i}] {cq}")
+    else:
+        print("  [WARNING] No CQs could be generated -- SPARQL validation will be skipped.")
+
+    _save_cqs_to_file(cqs, run_dir, source="auto-generated")
+
+    return {
+        "generated_cqs": cqs,
+        "messages": [f"CQ Generator: Auto-generated {len(cqs)} CQ(s) from schema + ontology."],
+    }
+
+
+def _save_cqs_to_file(cqs: list, run_dir: str, source: str = "generated") -> None:
+    """Write CQs to <run_dir>/cqs.txt for audit/debug purposes."""
+    os.makedirs(run_dir, exist_ok=True)
+    path = os.path.join(run_dir, "cqs.txt")
+    with open(path, "w") as f:
+        f.write(f"# Competency Questions ({source})\n")
+        f.write(f"# Generated: {datetime.now().isoformat()}\n")
+        f.write(f"# Total: {len(cqs)}\n\n")
+        for i, cq in enumerate(cqs, 1):
+            f.write(f"{i}. {cq}\n")
+    print(f"  [saved] CQs --> {path}")
+
+
 def schema_alignment_node(state):
     """Analyse ontology + CSV to produce a Functional Entity Plan.
 
@@ -237,49 +402,6 @@ def schema_alignment_node(state):
         "messages": [f"Schema Alignment: [{tag}] Entity plan created."]
     }
 
-
-def cq_validator_node(state):
-    """Validate the current YARRRML against user-provided Competency Questions.
-
-    If no CQs are provided, passes through without blocking.
-    """
-    cqs = state.get("competency_questions", [])
-    if not cqs:
-        return {
-            "cq_validation": {"feedback": "CQ_SKIPPED", "cq_results": []},
-            "feedback": "CQ_SKIPPED",
-            "messages": ["CQ Validator: No competency questions provided — skipping."]
-        }
-
-    print("  [CQ Validator] Checking YARRRML against Competency Questions...")
-    result = call_cq_validator_agent(state)
-    feedback = result["feedback"]
-    cq_results = result["cq_results"]
-
-    n_passed = sum(1 for r in cq_results if r["passed"])
-    n_total = len(cq_results)
-    n_layer_a = sum(1 for r in cq_results if r.get("layer") == "A")
-    n_layer_b = sum(1 for r in cq_results if r.get("layer") == "B")
-
-    current_cq_retries = state.get("cq_retry_count", 0)
-
-    layer_note = f" (LayerA:{n_layer_a} LayerB:{n_layer_b})"
-
-    if "CQ_PASSED" in feedback:
-        return {
-            "cq_validation": result,
-            "feedback": "CQ_PASSED",
-            "persistent_cq_failures": result.get("persistent_cq_failures", []),
-            "messages": [f"CQ Validator: [PASS] {n_passed}/{n_total} CQ(s) satisfied{layer_note}."]
-        }
-    else:
-        return {
-            "cq_validation": result,
-            "feedback": feedback,
-            "cq_retry_count": current_cq_retries + 1,
-            "persistent_cq_failures": result.get("persistent_cq_failures", []),
-            "messages": [f"CQ Validator: [FAIL] {n_total - n_passed}/{n_total} CQ(s) failed{layer_note} — routing back for fix."]
-        }
 
 
 def _fix_subject_lists(yarrrml: str) -> str:
@@ -449,19 +571,43 @@ def _dedup_po_entries(yarrrml_str: str) -> tuple[str, list[str]]:
             continue
 
         # Reverse pass: keep only the LAST occurrence of each dup predicate
+        # EXCEPT: when choosing between a 2-item (IRI) and 3-item (literal)
+        # entry for the same predicate, ALWAYS keep the 2-item IRI entry.
+        # This fixes Bug 3 (atMerchant/usesCard kept as literal not IRI).
+        def _is_iri_entry(e: list) -> bool:
+            """Return True if this is a 2-item IRI link (not a literal)."""
+            if len(e) == 2:
+                val = str(e[1])
+                return '~iri' in val or val.startswith('http')
+            return False
+
+        # Group entries by predicate to pick the best one
+        pred_entries: dict[str, list[list]] = {}
+        for entry in po:
+            if isinstance(entry, list) and len(entry) >= 2:
+                pred = str(entry[0])
+                if pred in dup_preds:
+                    pred_entries.setdefault(pred, []).append(entry)
+
+        # Choose winner for each dup predicate
+        pred_winner: dict[str, list] = {}
+        for pred, entries in pred_entries.items():
+            iri_entries = [e for e in entries if _is_iri_entry(e)]
+            pred_winner[pred] = iri_entries[0] if iri_entries else entries[-1]
+
         new_po: list = []
         kept: set[str] = set()
-        for entry in reversed(po):
+        for entry in po:
             if isinstance(entry, list) and len(entry) >= 2:
                 pred = str(entry[0])
                 if pred in dup_preds:
                     if pred not in kept:
+                        new_po.append(pred_winner[pred])
                         kept.add(pred)
-                        new_po.insert(0, entry)
                     else:
                         fixes.append(f"Removed duplicate '{pred}' in {mname}")
                     continue
-            new_po.insert(0, entry)
+            new_po.append(entry)
 
         mdef["po"] = new_po
 
@@ -549,6 +695,16 @@ def yarrrml_coordinator_node(state):
     # Strips ~iri from bare column refs that aren't URI templates
     # (e.g. $(user_handle)~iri → $(user_handle), xsd:string)
     yarrrml = _sanitize_iri_values(yarrrml)
+
+    # ── Final prefix reconciliation (safety net) ─────────────────
+    # _normalize_yarrrml_structure and _dedup_po_entries both perform YAML
+    # load+dump cycles that can silently drop auto-injected prefixes
+    # (e.g. lkg:, eli:).  Re-running reconciliation here guarantees every
+    # prefix:localName in the final YARRRML is declared, regardless of what
+    # any earlier transform did to the prefix block.
+    from agents.yarrrml_coordinator import _reconcile_prefixes as _final_reconcile
+    _ont_raw = state.get("ontology_info", {}).get("raw", "")
+    yarrrml = _final_reconcile(yarrrml, _ont_raw)
 
     # ── Save per-attempt debug files ─────────────────────────
     run_dir = state.get("run_dir", "data/output/debug")
@@ -774,7 +930,23 @@ def validation_node(state: AgentState):
         try:
             # Load the string as YAML and attempt Yatter translation
             yarrrml_data = yaml.load(yarrrml_content)
+
+            # ── Pre-flight: auto-fix missing prefixes in YARRRML before
+            #    passing to yatter.  This prevents yatter from silently
+            #    producing Turtle with undeclared prefixes.
+            from agents.refiner_agent import _auto_fix_missing_prefixes as _fix_pfx
+            _fixed_content, _pfx_fixes = _fix_pfx(yarrrml_content, yarrrml_data)
+            if _pfx_fixes:
+                for _f in _pfx_fixes:
+                    print(f"    [Validator-FIX] {_f}")
+                yarrrml_content = _fixed_content
+                yarrrml_data = yaml.load(yarrrml_content)
+
             rml_content = yatter.translate(yarrrml_data)
+
+            # ── Post-flight: inject any prefixes yatter still dropped ──
+            rml_content = _inject_missing_rml_prefixes(yarrrml_data, rml_content,
+                                                        yarrrml_text=yarrrml_content)
         finally:
             root_logger.removeHandler(handler)
 
@@ -812,8 +984,11 @@ def validation_node(state: AgentState):
                 "retry_needed": True,
             }
 
-        # If successful, move to logic check
+        # If successful, move to logic check.
+        # Always propagate the (possibly prefix-fixed) YARRRML so all
+        # downstream nodes use the corrected version.
         return {
+            "yarrrml_output": yarrrml_content,
             "messages": ["Validator: Syntax is valid."],
             "feedback": "PASSED_SYNTAX"
         }
@@ -879,14 +1054,41 @@ def _internal_yarrrml_to_rml(yarrrml_content, csv_path):
     Helper to convert YARRRML string to RML string and patch CSV paths.
     Handles both full-relative-path and basename-only sources.
     """
-    # Normalisation already done in yarrrml_coordinator_node — skip here
-    # Use pure=True to match validation_node — the C-extension parser
-    # can be stricter about unquoted colons in flow sequences.
     yaml = YAML(typ='safe', pure=True)
     yarrrml_data = yaml.load(yarrrml_content)
 
+    # ── Pre-flight: ensure all prefixes used in the YARRRML are declared
+    #    before handing to yatter.  Island-wiring and column auto-injection
+    #    in the refiner can introduce new ex: usages AFTER the refiner's
+    #    early prefix check.  Yatter silently returns None when it encounters
+    #    an undeclared prefix, which then crashes the CSV path-patching below.
+    #
+    #    IMPORTANT: update BOTH yarrrml_content AND yarrrml_data so yatter
+    #    receives the corrected version.
+    from agents.refiner_agent import _auto_fix_missing_prefixes as _preflight_fix
+    _pf_fixed, _pf_fixes = _preflight_fix(yarrrml_content, yarrrml_data)
+    if _pf_fixes:
+        for _f in _pf_fixes:
+            print(f"    [RML-PREFLIGHT] {_f}")
+        yarrrml_content = _pf_fixed          # ← update text too
+        yarrrml_data = yaml.load(_pf_fixed)
+
     # Translate YARRRML to RML (Turtle syntax)
     rml_content = yatter.translate(yarrrml_data)
+
+    # Guard: yatter returns None when it encounters an undeclared prefix.
+    if rml_content is None:
+        raise ValueError(
+            "Yatter returned None — the YARRRML still contains an undeclared prefix. "
+            "Check that every prefix:localname in the mappings has a matching entry "
+            "in the prefixes: block."
+        )
+    rml_content = str(rml_content)
+
+    # Safety net: inject any @prefix declarations that yatter still dropped.
+    # Pass the YARRRML text as well so text-injected prefixes are caught.
+    rml_content = _inject_missing_rml_prefixes(yarrrml_data, rml_content,
+                                                yarrrml_text=yarrrml_content)
 
     # Patch the rml:source to use the absolute path of the CSV.
     # The source in the RML may be the full relative path (e.g. data/input/file.csv)
@@ -956,11 +1158,483 @@ mappings: {rml_tmp_path}
         return {"messages": [error_msg]}
 
 
+# ────────────────────────────────────────────────────────────────────
+# SPARQL-based CQ Validator Node (post-KG generation)
+# ────────────────────────────────────────────────────────────────────
+
+def _log_section(title: str, width: int = 56) -> None:
+    """Print a clearly visible section header for a pipeline stage."""
+    bar = "-" * width
+    print(f"\n  +{bar}+")
+    print(f"  |  {title:<{width - 2}}|")
+    print(f"  +{bar}+")
 
 
+def _ask_user_continue(n_passed: int, n_total: int, timeout: int = 5) -> bool:
+    """Prompt the user whether to continue optimizing when pass rate hits threshold.
+
+    Waits ``timeout`` seconds for input on stdin.  Returns:
+      - True  → user typed 'y' / 'yes'  → pipeline keeps retrying
+      - False → any other input, or no input within timeout
+                → pipeline accepts the current KG as-is
+
+    Uses ``select`` for non-blocking stdin (Linux / macOS).
+    Falls back silently to False on Windows or redirected stdin.
+    """
+    import sys
+    import select as _select
+
+    pct = int(n_passed / n_total * 100) if n_total else 0
+    bar = "─" * 57
+
+    print(f"\n  +{bar}+")
+    print(f"  │  ⚡ {n_passed}/{n_total} ({pct}%) competency questions answered        │")
+    print(f"  │                                                         │")
+    print(f"  │  The KG partially satisfies your questions.             │")
+    print(f"  │  Continue optimizing to reach 100%?                     │")
+    print(f"  │  [y = yes  /  Enter or anything else = accept & stop]   │")
+    print(f"  │  Auto-accepts in {timeout}s if no input.                      │")
+    print(f"  +{bar}+")
+    print(f"  > ", end="", flush=True)
+
+    try:
+        rlist, _, _ = _select.select([sys.stdin], [], [], timeout)
+        if rlist:
+            answer = sys.stdin.readline().strip().lower()
+            if answer in ("y", "yes"):
+                print(f"  → Continuing optimization "
+                      f"({n_total - n_passed} question(s) still failing)...")
+                return True
+            else:
+                print(f"  → Accepted. Keeping current KG ({n_passed}/{n_total} passed).")
+                return False
+        else:
+            print(f"\n  → No response in {timeout}s — "
+                  f"accepting current KG ({n_passed}/{n_total} passed).")
+            return False
+    except Exception:
+        # Windows or non-interactive stdin — accept silently
+        print(f"\n  → Non-interactive mode — "
+              f"accepting current KG ({n_passed}/{n_total} passed).")
+        return False
 
 
+def _save_sparql_report(results: list, run_dir: str, retry: int = 0) -> None:
+    """Write the full SPARQL validation report (CQs + queries + results) to file."""
+    import json as _json
+    os.makedirs(run_dir, exist_ok=True)
+    suffix = f"_retry{retry}" if retry > 0 else ""
+    txt_path = os.path.join(run_dir, f"sparql_validation{suffix}.txt")
+    json_path = os.path.join(run_dir, f"sparql_validation{suffix}.json")
+
+    with open(txt_path, "w") as f:
+        f.write(f"# SPARQL CQ Validation Report\n")
+        f.write(f"# Generated: {datetime.now().isoformat()}\n")
+        f.write(f"# Retry: {retry}\n")
+        f.write(f"# Total checks: {len(results)}\n\n")
+        for i, r in enumerate(results, 1):
+            status = "PASS" if r["passed"] is True else ("FAIL" if r["passed"] is False else "SKIP")
+            src = r.get("source", "unknown")
+            f.write(f"[{i}] {status}  [{src}]\n")
+            f.write(f"  CQ      : {r['cq']}\n")
+            f.write(f"  SPARQL  :\n")
+            for line in r["sparql"].strip().splitlines():
+                f.write(f"    {line}\n")
+            if r.get("diagnosis"):
+                f.write(f"  Diagnosis: {r['diagnosis']}\n")
+            f.write("\n")
+
+    with open(json_path, "w") as f:
+        _json.dump(results, f, indent=2)
+
+    print(f"  [saved] SPARQL validation report --> {txt_path}")
 
 
+def sparql_cq_validator_node(state: AgentState):
+    """Validate Competency Questions via SPARQL execution on the materialized KG.
 
+    Handles three input modes (all optional, combinable):
+      1. User-provided CQs (``--cqs``)    → translated to ASK SPARQL by LLM
+      2. Auto-generated CQs               → translated to ASK SPARQL by LLM
+      3. User-provided SPARQL queries     → executed directly (no LLM translation)
+
+    Steps
+    -----
+    1. Collect all CQs (user + generated) and direct SPARQL queries.
+    2. Skip if none of the above are present.
+    3. Load the generated KG into an in-memory pyoxigraph store.
+    4. For direct SPARQL: execute as-is.
+    5. For CQs: use CQ→SPARQL LLM agent with self-correction, then execute.
+    6. Build structured feedback with exact failing triple patterns for refiner.
+    """
+    import pyoxigraph
+
+    _log_section("SPARQL CQ Validator")
+
+    user_cqs = state.get("competency_questions", [])
+    generated_cqs = state.get("generated_cqs", [])
+    user_sparql = state.get("user_sparql_queries", [])  # direct SPARQL from user
+
+    # Combine all CQs (user takes priority, then generated)
+    all_cqs = list(user_cqs) + [cq for cq in generated_cqs if cq not in user_cqs]
+
+    if not all_cqs and not user_sparql:
+        return {
+            "sparql_validation_results": [],
+            "feedback": "CQ_SPARQL_PASSED",
+            "messages": ["SPARQL CQ Validator: No CQs or SPARQL queries provided — skipping."],
+        }
+
+    kg_path = state.get("rdf_output", "")
+    if not kg_path or not os.path.exists(kg_path):
+        return {
+            "sparql_validation_results": [],
+            "feedback": "CQ_SPARQL_PASSED",
+            "messages": ["SPARQL CQ Validator: KG not available — skipping CQ validation."],
+        }
+
+    cq_sparql_retry_count = state.get("cq_sparql_retry_count", 0)
+    max_cq_sparql_retries = int(os.environ.get("CQ_SPARQL_MAX_RETRIES", "3"))
+
+    source_summary = []
+    if user_cqs:
+        source_summary.append(f"{len(user_cqs)} user CQ(s)")
+    if generated_cqs:
+        source_summary.append(f"{len(generated_cqs)} auto-generated CQ(s)")
+    if user_sparql:
+        source_summary.append(f"{len(user_sparql)} direct SPARQL query(ies)")
+    print(f"  [SPARQL CQ Validator] Loading KG from {kg_path} "
+          f"[{', '.join(source_summary)}] ...")
+
+    # ── Load KG into in-memory pyoxigraph store ──────────────────────────
+    store = pyoxigraph.Store()
+    try:
+        with open(kg_path, "rb") as f:
+            store.load(f, format=pyoxigraph.RdfFormat.N_TRIPLES)
+    except Exception as e:
+        return {
+            "sparql_validation_results": [],
+            "feedback": "CQ_SPARQL_PASSED",
+            "messages": [f"SPARQL CQ Validator: Could not load KG ({e}) — skipping."],
+        }
+
+    results = []
+
+    # ── Mode 1: Execute user-provided SPARQL directly (no LLM) ──────────
+    for sparql in user_sparql:
+        label = sparql.strip()[:60]
+        try:
+            ask_result = store.query(sparql)
+            passed = bool(ask_result)
+        except Exception as e:
+            print(f"    [SPARQL CQ Validator] Execution error on user SPARQL: {e}")
+            results.append({
+                "cq": f"[Direct SPARQL] {label}",
+                "sparql": sparql,
+                "passed": None,
+                "diagnosis": f"Execution error: {e}",
+                "source": "user_sparql",
+            })
+            continue
+
+        status = "PASS" if passed else "FAIL"
+        print(f"    [{status}]  [direct SPARQL] {label}")
+        results.append({
+            "cq": f"[Direct SPARQL] {label}",
+            "sparql": sparql,
+            "passed": passed,
+            "diagnosis": "" if passed else f"ASK returned false. Pattern: {_extract_triple_patterns(sparql)}",
+            "source": "user_sparql",
+        })
+
+    # ── Mode 2 & 3: Translate CQs → SPARQL then execute ─────────────────
+    if all_cqs:
+        ontology_info = state.get("ontology_info", {})
+        base_uri = state.get("base_uri", "http://example.org/")
+
+        # Extract actual prefixes from the generated YARRRML so SPARQL queries
+        # use the same namespaces as the materialised KG (Bug 2 fix)
+        yarrrml_str = state.get("yarrrml_output", "")
+        yarrrml_prefix_map = extract_yarrrml_prefixes(yarrrml_str) if yarrrml_str else {}
+        if yarrrml_prefix_map:
+            print(f"  [SPARQL CQ Validator] Using {len(yarrrml_prefix_map)} prefix(es) "
+                  f"from YARRRML: {list(yarrrml_prefix_map.keys())}")
+
+        # Extract entity types and predicates from YARRRML to ground SPARQL generation
+        mapping_context = extract_yarrrml_mapping_context(yarrrml_str) if yarrrml_str else None
+
+        # Probe the live KG for actual classes and predicates — strongest grounding signal.
+        # This prevents the LLM from writing ?s a schema:Order when only schema:OrderItem exists.
+        kg_path = state.get("rdf_output", "")
+        kg_probe = probe_kg_types_and_predicates(kg_path) if kg_path else {}
+        kg_grounding = build_kg_grounding_block(kg_probe)
+        if kg_grounding:
+            print(f"  [SPARQL CQ Validator] KG probe: {len(kg_probe.get('classes', []))} class(es), "
+                  f"{len(kg_probe.get('predicates', []))} predicate(s) found")
+
+        print(f"  [SPARQL CQ Validator] Translating {len(all_cqs)} CQ(s) to SPARQL ...")
+        cq_sparql_list = batch_cq_to_sparql(
+            all_cqs, ontology_info, base_uri=base_uri,
+            yarrrml_prefix_map=yarrrml_prefix_map,
+            mapping_context=mapping_context,
+            kg_grounding_block=kg_grounding or None,
+        )
+
+        for item in cq_sparql_list:
+            cq = item["cq"]
+            sparql = item["sparql"]
+            source = "user_cq" if cq in user_cqs else "generated_cq"
+
+            if not item["valid"]:
+                print(f"    [WARNING] Invalid SPARQL for: {cq[:60]}")
+                results.append({
+                    "cq": cq,
+                    "sparql": sparql,
+                    "passed": None,
+                    "diagnosis": f"SPARQL generation failed: {item['error']}",
+                    "source": source,
+                })
+                continue
+
+            # Execute ASK query
+            try:
+                ask_result = store.query(sparql)
+                passed = bool(ask_result)
+            except Exception as e:
+                # Fallback: re-prompt with error
+                from agents.cq_to_sparql_agent import cq_to_sparql
+                corrected = cq_to_sparql(
+                    cq, ontology_info, base_uri=base_uri,
+                    previous_error=str(e), previous_sparql=sparql,
+                    yarrrml_prefix_map=yarrrml_prefix_map,
+                    mapping_context=mapping_context,
+                    kg_grounding_block=kg_grounding or None,
+                )
+                try:
+                    ask_result = store.query(corrected)
+                    passed = bool(ask_result)
+                    sparql = corrected
+                except Exception as e2:
+                    results.append({
+                        "cq": cq, "sparql": corrected,
+                        "passed": None,
+                        "diagnosis": f"Execution error after correction: {e2}",
+                        "source": source,
+                    })
+                    continue
+
+            status = "PASS" if passed else "FAIL"
+            src_label = "user CQ" if source == "user_cq" else "auto CQ"
+            print(f"    [{status}]  [{src_label}] {cq[:70]}")
+
+            diagnosis = ""
+            if not passed:
+                # Run a SELECT probe to give a better diagnosis:
+                # try to find which part of the triple pattern actually exists.
+                triple_pat = _extract_triple_patterns(sparql)
+                probe_diagnosis = _select_probe_diagnosis(store, sparql)
+                diagnosis = probe_diagnosis if probe_diagnosis else f"ASK returned false. Missing: {triple_pat}"
+
+            results.append({
+                "cq": cq,
+                "sparql": sparql,
+                "passed": passed,
+                "diagnosis": diagnosis,
+                "source": source,
+            })
+
+    # ── Evaluate overall result ──────────────────────────────────────────
+    definite_failures = [r for r in results if r["passed"] is False]
+    syntax_failures   = [r for r in results if r["passed"] is None]   # SPARQL gen failed
+    n_total  = len(results)
+    n_passed = sum(1 for r in results if r["passed"] is True)
+    n_unknown = len(syntax_failures)
+
+    # ── Save SPARQL validation report to run_dir ─────────────────────────
+    _save_sparql_report(results, state.get("run_dir", "data/output/debug"),
+                        retry=cq_sparql_retry_count)
+
+    if not definite_failures:
+        print(f"  [PASS] All {n_passed}/{n_total} check(s) covered by the KG")
+        if n_unknown:
+            print(f"  [WARNING] {n_unknown} check(s) had SPARQL generation errors — treated as skipped")
+        return {
+            "sparql_validation_results": results,
+            "feedback": "CQ_SPARQL_PASSED",
+            "persistent_cq_failures": [],
+            "messages": [f"SPARQL CQ Validator: [PASS] {n_passed}/{n_total} check(s) covered by KG."],
+        }
+
+    # ── Fix 3: Distinguish syntax failures from KG coverage failures ─────
+    # A "syntax failure" is a result where passed=None (SPARQL could not even
+    # be parsed/executed).  These indicate the SPARQL generator produced invalid
+    # queries — they do NOT indicate anything wrong with the YARRRML/KG.
+    # Re-generating YARRRML for syntax failures wastes 3×55s and changes nothing.
+    #
+    # A "KG coverage failure" is a result where passed=False (valid SPARQL but
+    # ASK returned false) — these indicate the KG is missing triples, so
+    # YARRRML re-generation is the right response.
+    all_failures_are_syntax = (
+        len(definite_failures) == 0
+        and len(syntax_failures) > 0
+    )
+    mixed_but_mostly_syntax = (
+        len(syntax_failures) > 0
+        and len(definite_failures) <= 1
+        and len(syntax_failures) >= len(definite_failures) * 2
+    )
+
+    if all_failures_are_syntax or mixed_but_mostly_syntax:
+        # The SPARQL generator is producing invalid queries.
+        # Mark as "SPARQL_SYNTAX_ONLY" so the workflow knows NOT to
+        # re-generate YARRRML — it should only re-run SPARQL translation.
+        print(
+            f"  [SPARQL CQ Validator] {len(syntax_failures)} syntax-only SPARQL failure(s) "
+            f"— YARRRML is fine, only SPARQL queries need fixing."
+        )
+        return {
+            "sparql_validation_results": results,
+            "feedback": "CQ_SPARQL_PASSED",   # treat as pass — not a KG problem
+            "persistent_cq_failures": [],
+            "messages": [
+                f"SPARQL CQ Validator: {len(syntax_failures)} SPARQL syntax error(s) "
+                f"(not a KG issue) — accepting current KG."
+            ],
+        }
+
+    # ── Partial-pass threshold: ask user whether to keep retrying ────────
+    # If pass_rate >= CQ_CONTINUE_THRESHOLD (default 70%) but not 100%,
+    # prompt the user interactively.  Auto-accepts after CQ_CONTINUE_TIMEOUT
+    # seconds (default 5s) if there is no response.
+    _threshold = float(os.environ.get("CQ_CONTINUE_THRESHOLD", "0.70"))
+    _pass_rate  = n_passed / n_total if n_total > 0 else 0.0
+    _timeout    = int(os.environ.get("CQ_CONTINUE_TIMEOUT", "5"))
+
+    if _pass_rate >= _threshold and definite_failures:
+        _user_continues = _ask_user_continue(n_passed, n_total, timeout=_timeout)
+        if not _user_continues:
+            # User accepted partial results (or timed out) — treat as passed
+            return {
+                "sparql_validation_results": results,
+                "feedback": "CQ_SPARQL_PASSED",
+                "persistent_cq_failures": [],
+                "messages": [
+                    f"SPARQL CQ Validator: [ACCEPTED] {n_passed}/{n_total} "
+                    f"({int(_pass_rate * 100)}%) — user accepted partial results."
+                ],
+            }
+        # User said 'yes' → fall through to build error feedback and retry
+
+    # ── Build structured feedback for refiner ────────────────────────────
+    failure_lines = []
+    for f in definite_failures:
+        src_tag = {"user_cq": "user CQ", "generated_cq": "auto CQ", "user_sparql": "direct SPARQL"}.get(f["source"], f["source"])
+        failure_lines.append(
+            f"  [{src_tag}] CQ: \"{f['cq']}\"\n"
+            f"  SPARQL tried: {f['sparql'].strip()}\n"
+            f"  Diagnosis: {f['diagnosis']}"
+        )
+
+    feedback = (
+        f"CQ_SPARQL_ERROR: {len(definite_failures)}/{n_total} check(s) "
+        f"are NOT covered by the generated KG (verified by SPARQL execution).\n\n"
+        f"FAILED CHECKS:\n" + "\n\n".join(failure_lines) + "\n\n"
+        f"INSTRUCTIONS: Fix the YARRRML mapping to produce the missing triple patterns "
+        f"shown above. Add or correct the predicateObjectMap for the relevant CSV columns. "
+        f"Do NOT change mappings for passing checks."
+    )
+
+    prev_persistent = state.get("persistent_cq_failures", [])
+    prev_failing_cqs = {p["cq"] if isinstance(p, dict) else p for p in prev_persistent}
+    now_failing_cqs = {f["cq"] for f in definite_failures}
+
+    return {
+        "sparql_validation_results": results,
+        "feedback": feedback,
+        "cq_sparql_retry_count": cq_sparql_retry_count + 1,
+        "persistent_cq_failures": definite_failures,
+        "messages": [
+            f"SPARQL CQ Validator: [FAIL] {len(definite_failures)}/{n_total} check(s) "
+            f"not covered — routing to refiner "
+            f"(attempt {cq_sparql_retry_count + 1}/{max_cq_sparql_retries})."
+        ],
+    }
+
+
+def _extract_triple_patterns(sparql: str) -> str:
+    """Extract the triple patterns inside the ASK { ... } block for the diagnosis.
+
+    Handles nested braces (OPTIONAL, FILTER EXISTS, etc.) by counting
+    brace depth instead of using a simple regex.
+    """
+    upper = sparql.upper()
+    ask_pos = upper.find("ASK")
+    if ask_pos == -1:
+        return sparql.strip()
+
+    start = sparql.find("{", ask_pos)
+    if start == -1:
+        return sparql.strip()
+
+    depth = 0
+    end = start
+    for i, ch in enumerate(sparql[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+
+    return sparql[start + 1:end].strip()
+
+
+def _select_probe_diagnosis(store, ask_sparql: str) -> str:
+    """When an ASK query returns false, run targeted SELECT probes to diagnose why.
+
+    Extracts the first ?s a <Type> triple from the ASK body and checks:
+    1. Does ANY triple with the rdf:type predicate exist for that type?
+    2. If yes, the type exists but the full pattern fails — report that.
+    3. If no, report the type is absent from the KG entirely.
+
+    Returns a human-readable diagnosis string, or "" on any error.
+    Fully agnostic — reads patterns from the SPARQL itself.
+    """
+    import re as _re
+    try:
+        # Extract rdf:type assertions: ?s a <Type> or ?s a prefix:Local
+        type_pat = _re.search(
+            r'\?(\w+)\s+a\s+(<[^>]+>|[\w]+:[\w]+)',
+            ask_sparql,
+        )
+        if not type_pat:
+            return ""
+
+        var_name = type_pat.group(1)
+        type_val = type_pat.group(2)
+
+        # Build a simple SELECT COUNT to check existence
+        # Extract PREFIX declarations from the ASK query
+        prefix_lines = "\n".join(
+            l for l in ask_sparql.splitlines()
+            if l.strip().upper().startswith("PREFIX")
+        )
+
+        probe = f"{prefix_lines}\nSELECT (COUNT(?s) AS ?cnt) WHERE {{ ?s a {type_val} }} LIMIT 1"
+        rows = list(store.query(probe))
+        count = int(str(rows[0][0])) if rows else 0
+
+        if count == 0:
+            return (
+                f"Type {type_val} does not exist in KG — the mapping may not create "
+                f"resources of this type. Check entity agent output."
+            )
+        else:
+            return (
+                f"Type {type_val} exists ({count} instance(s)) but the full triple "
+                f"pattern did not match — a predicate or value may differ from the KG."
+            )
+    except Exception:
+        return ""
 
