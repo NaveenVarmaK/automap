@@ -298,16 +298,34 @@ def _apply_base_uri_to_subjects(yarrrml_str: str, base_uri: str) -> tuple[str, l
 
         # Don't rewrite if already using the target prefix
         if old_prefix == prefix_name:
-            continue
+            # Same prefix name but the URI might still be wrong (e.g. LLM used
+            # mykg: http://example.org/mykg# but user wants http://mykg.org/resource/).
+            # Always overwrite the prefix URI — don't skip.
+            pass
+        else:
+            new_subj = f"{prefix_name}:{rest}"
+            mdef["s"] = new_subj
+            changes.append(
+                f"[BaseURI] {mname}: s: {subj!r} → {new_subj!r}"
+            )
 
-        new_subj = f"{prefix_name}:{rest}"
-        mdef["s"] = new_subj
-        changes.append(
-            f"[BaseURI] {mname}: s: {subj!r} → {new_subj!r}"
-        )
+    # Always re-serialise when the prefix URI was updated (even if no subjects
+    # needed renaming), so the YAML reflects the corrected URI.
+    old_prefix_uri = None
+    try:
+        import yaml as _yaml_check
+        _old_data = _yaml_check.safe_load(yarrrml_str)
+        old_prefix_uri = (_old_data or {}).get("prefixes", {}).get(prefix_name)
+    except Exception:
+        pass
 
-    if not changes:
+    prefix_uri_changed = old_prefix_uri != base_uri  # also True when key was absent
+
+    if not changes and not prefix_uri_changed:
         return yarrrml_str, []
+
+    if not changes and prefix_uri_changed:
+        changes.append(f"[BaseURI] Updated prefix {prefix_name}: <{old_prefix_uri}> → <{base_uri}>")
 
     # Re-serialise — use ruamel to preserve flow-style po entries
     try:

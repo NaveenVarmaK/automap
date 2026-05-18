@@ -702,9 +702,20 @@ def yarrrml_coordinator_node(state):
     # (e.g. lkg:, eli:).  Re-running reconciliation here guarantees every
     # prefix:localName in the final YARRRML is declared, regardless of what
     # any earlier transform did to the prefix block.
-    from agents.yarrrml_coordinator import _reconcile_prefixes as _final_reconcile
+    from agents.yarrrml_coordinator import _reconcile_prefixes as _final_reconcile, _apply_base_uri_to_subjects as _apply_base_uri
     _ont_raw = state.get("ontology_info", {}).get("raw", "")
     yarrrml = _final_reconcile(yarrrml, _ont_raw)
+
+    # ── Re-apply base URI as the VERY LAST step ───────────────────
+    # _normalize_yarrrml_structure and _final_reconcile above both do YAML
+    # round-trips that can overwrite the prefix URI set by the coordinator's
+    # step 9 (e.g. putting back mykg: http://example.org/mykg# instead of
+    # http://mykg.org/resource/).  Re-applying here ensures the user's
+    # BASE_URI is always respected in the final output.
+    _user_base_uri = state.get("base_uri", "http://example.org/")
+    yarrrml, _base_uri_node_changes = _apply_base_uri(yarrrml, _user_base_uri)
+    for _chg in _base_uri_node_changes:
+        print(f"    [Coordinator/node] {_chg}")
 
     # ── Save per-attempt debug files ─────────────────────────
     run_dir = state.get("run_dir", "data/output/debug")
@@ -1162,6 +1173,60 @@ mappings: {rml_tmp_path}
 # SPARQL-based CQ Validator Node (post-KG generation)
 # ────────────────────────────────────────────────────────────────────
 
+def _extract_triple_patterns(sparql: str) -> str:
+    """Extract the triple patterns inside the ASK { ... } block for the diagnosis."""
+    upper = sparql.upper()
+    ask_pos = upper.find("ASK")
+    if ask_pos == -1:
+        return sparql.strip()
+    start = sparql.find("{", ask_pos)
+    if start == -1:
+        return sparql.strip()
+    depth = 0
+    end = start
+    for i, ch in enumerate(sparql[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    return sparql[start + 1:end].strip()
+
+
+def _select_probe_diagnosis(store, ask_sparql: str) -> str:
+    """When an ASK query returns false, run targeted SELECT probes to diagnose why."""
+    import re as _re
+    try:
+        type_pat = _re.search(
+            r'\?(\w+)\s+a\s+(<[^>]+>|[\w]+:[\w]+)',
+            ask_sparql,
+        )
+        if not type_pat:
+            return ""
+        type_val = type_pat.group(2)
+        prefix_lines = "\n".join(
+            l for l in ask_sparql.splitlines()
+            if l.strip().upper().startswith("PREFIX")
+        )
+        probe = f"{prefix_lines}\nSELECT (COUNT(?s) AS ?cnt) WHERE {{ ?s a {type_val} }} LIMIT 1"
+        rows = list(store.query(probe))
+        count = int(str(rows[0][0])) if rows else 0
+        if count == 0:
+            return (
+                f"Type {type_val} does not exist in KG — the mapping may not create "
+                f"resources of this type. Check entity agent output."
+            )
+        else:
+            return (
+                f"Type {type_val} exists ({count} instance(s)) but the full triple "
+                f"pattern did not match — a predicate or value may differ from the KG."
+            )
+    except Exception:
+        return ""
+
+
 def _log_section(title: str, width: int = 56) -> None:
     """Print a clearly visible section header for a pipeline stage."""
     bar = "-" * width
@@ -1561,80 +1626,240 @@ def sparql_cq_validator_node(state: AgentState):
     }
 
 
-def _extract_triple_patterns(sparql: str) -> str:
-    """Extract the triple patterns inside the ASK { ... } block for the diagnosis.
+def _parse_shacl_violations(results_text: str) -> list[str]:
+    """Extract human-readable, deduplicated violation summaries from pyshacl text report.
 
-    Handles nested braces (OPTIONAL, FILTER EXISTS, etc.) by counting
-    brace depth instead of using a simple regex.
+    Groups violations by (ConstraintComponent, ResultPath/Message) so that
+    the same structural problem affecting many nodes is reported as ONE
+    summarised violation rather than dozens of identical lines.
+
+    Fully agnostic — works with both Astrea-generated and fallback shapes.
     """
-    upper = sparql.upper()
-    ask_pos = upper.find("ASK")
-    if ask_pos == -1:
-        return sparql.strip()
+    import collections as _coll
 
-    start = sparql.find("{", ask_pos)
-    if start == -1:
-        return sparql.strip()
+    # Parse individual violation blocks
+    raw_violations: list[dict] = []
+    current: dict = {}
+    for line in results_text.splitlines():
+        line = line.strip()
+        if line.startswith("Constraint Violation"):
+            if current:
+                raw_violations.append(current)
+            current = {}
+        elif line.startswith("Constraint Component:"):
+            current["component"] = line.split(":", 1)[-1].strip()
+        elif line.startswith("Result Path:"):
+            current["path"] = line.split(":", 1)[-1].strip()
+        elif line.startswith("Message:"):
+            current["message"] = line.split(":", 1)[-1].strip()
+        elif line.startswith("Focus Node:"):
+            current.setdefault("focus_nodes", []).append(line.split(":", 1)[-1].strip())
+        elif line.startswith("Source Shape:"):
+            current["shape"] = line.split(":", 1)[-1].strip()
+    if current:
+        raw_violations.append(current)
 
-    depth = 0
-    end = start
-    for i, ch in enumerate(sparql[start:], start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                end = i
-                break
+    if not raw_violations:
+        # Fallback: extract raw lines if structured parsing found nothing
+        violations: list[str] = []
+        for line in results_text.splitlines():
+            if "Violation" in line or "Message:" in line:
+                violations.append(line.strip())
+        return violations[:20]
 
-    return sparql[start + 1:end].strip()
+    # Group by (component, path/message) to deduplicate repeated instances
+    groups: dict[str, list[dict]] = _coll.OrderedDict()
+    for v in raw_violations:
+        key = (v.get("component", "?"), v.get("path", v.get("message", "?")))
+        groups.setdefault(str(key), []).append(v)
+
+    summaries: list[str] = []
+    for key_str, instances in groups.items():
+        rep = instances[0]
+        component = rep.get("component", "unknown constraint")
+        path = rep.get("path", "")
+        message = rep.get("message", "")
+        count = len(instances)
+        # Build a concise summary
+        parts = []
+        if path:
+            parts.append(f"path={path}")
+        if message:
+            parts.append(message)
+        if count > 1:
+            parts.append(f"({count} nodes affected)")
+        # Show up to 2 example focus nodes
+        sample_nodes = []
+        for inst in instances[:2]:
+            for fn in inst.get("focus_nodes", []):
+                sample_nodes.append(fn)
+        if sample_nodes:
+            parts.append(f"e.g. {', '.join(sample_nodes[:2])}")
+        short_comp = component.split("#")[-1] if "#" in component else component
+        summaries.append(f"[{short_comp}] {' | '.join(parts)}")
+
+    return summaries
 
 
-def _select_probe_diagnosis(store, ask_sparql: str) -> str:
-    """When an ASK query returns false, run targeted SELECT probes to diagnose why.
+def shacl_validation_node(state: AgentState) -> dict:
+    """Dataset-agnostic SHACL validation node.
 
-    Extracts the first ?s a <Type> triple from the ASK body and checks:
-    1. Does ANY triple with the rdf:type predicate exist for that type?
-    2. If yes, the type exists but the full pattern fails — report that.
-    3. If no, report the type is absent from the KG entirely.
+    Uses Astrea to auto-generate SHACL shapes from the pipeline's own
+    ontology (any OWL ontology — no dataset-specific shapes needed), then
+    validates the materialised KG with pyshacl.  Feeds structured violation
+    feedback back into the YARRRML generation loop.
 
-    Returns a human-readable diagnosis string, or "" on any error.
-    Fully agnostic — reads patterns from the SPARQL itself.
+    Skipped entirely when ``state["shacl_enabled"]`` is False (i.e. the
+    user did not pass ``--shacl``).
     """
-    import re as _re
+    if not state.get("shacl_enabled", False) and not os.environ.get("SHACL_ENABLED"):
+        return {
+            "feedback": "SHACL_SKIP: --shacl not requested",
+            "messages": ["[SHACL] Skipped (--shacl not set)"],
+        }
+
+    rdf_path = state.get("rdf_output", "")
+    ontology_path = state.get("ontology_path", "")
+    run_dir = state.get("run_dir", "data/output")
+
+    if not rdf_path or not os.path.exists(rdf_path):
+        return {
+            "feedback": "SHACL_SKIP: No KG to validate",
+            "messages": ["[SHACL] No KG found — skipped"],
+        }
+
+    import requests as _requests
+
     try:
-        # Extract rdf:type assertions: ?s a <Type> or ?s a prefix:Local
-        type_pat = _re.search(
-            r'\?(\w+)\s+a\s+(<[^>]+>|[\w]+:[\w]+)',
-            ask_sparql,
-        )
-        if not type_pat:
-            return ""
+        from pyshacl import validate as _shacl_validate
+    except ImportError:
+        return {
+            "feedback": "SHACL_SKIP: pyshacl not installed (run: uv add pyshacl)",
+            "messages": ["[SHACL] pyshacl not available — skipped"],
+        }
 
-        var_name = type_pat.group(1)
-        type_val = type_pat.group(2)
+    # ── Step 1: Generate SHACL shapes via Astrea ─────────────────────
+    shapes_ttl: str | None = None
+    shapes_path = os.path.join(run_dir, "shacl_shapes.ttl")
 
-        # Build a simple SELECT COUNT to check existence
-        # Extract PREFIX declarations from the ASK query
-        prefix_lines = "\n".join(
-            l for l in ask_sparql.splitlines()
-            if l.strip().upper().startswith("PREFIX")
-        )
-
-        probe = f"{prefix_lines}\nSELECT (COUNT(?s) AS ?cnt) WHERE {{ ?s a {type_val} }} LIMIT 1"
-        rows = list(store.query(probe))
-        count = int(str(rows[0][0])) if rows else 0
-
-        if count == 0:
-            return (
-                f"Type {type_val} does not exist in KG — the mapping may not create "
-                f"resources of this type. Check entity agent output."
+    if ontology_path and os.path.exists(ontology_path):
+        try:
+            with open(ontology_path, "rb") as _f:
+                _ont_bytes = _f.read()
+            # Astrea REST endpoint — derives shapes from ANY OWL ontology
+            _resp = _requests.post(
+                "https://astrea.linkeddata.es/api/shacl",
+                data=_ont_bytes,
+                headers={"Content-Type": "text/turtle", "Accept": "text/turtle"},
+                timeout=30,
             )
-        else:
-            return (
-                f"Type {type_val} exists ({count} instance(s)) but the full triple "
-                f"pattern did not match — a predicate or value may differ from the KG."
-            )
-    except Exception:
-        return ""
+            if _resp.status_code == 200 and _resp.text.strip():
+                shapes_ttl = _resp.text
+                with open(shapes_path, "w") as _sf:
+                    _sf.write(shapes_ttl)
+                _n = shapes_ttl.count("sh:NodeShape")
+                print(f"    [SHACL] Astrea generated {_n} NodeShape(s) from ontology")
+            else:
+                print(f"    [SHACL] Astrea returned HTTP {_resp.status_code} — using fallback shapes")
+        except Exception as _e:
+            print(f"    [SHACL] Astrea unreachable ({_e}) — using fallback shapes")
+
+    if not shapes_ttl:
+        # ── Fallback shapes (Astrea unavailable) ─────────────────────
+        # These check basic RDF structural correctness that ANY valid KG
+        # must satisfy, fully agnostic of dataset or ontology.
+        #
+        # WHY inference="none" is required (see Step 2):
+        # RDFS inference auto-asserts  "literal"^^dtype  rdf:type  dtype
+        # for every typed literal.  If we used sh:targetSubjectsOf rdf:type
+        # with inference enabled, those inferred triples would make every
+        # typed literal a validation target and generate hundreds of false
+        # NodeKind violations.  With inference="none" only explicit triples
+        # are evaluated, so sh:targetSubjectsOf rdf:type safely targets only
+        # explicit class assertions whose subjects must be IRIs.
+        shapes_ttl = "\n".join([
+            "@prefix sh:  <http://www.w3.org/ns/shacl#> .",
+            "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .",
+            "@prefix owl: <http://www.w3.org/2002/07/owl#> .",
+            "",
+            "# Rule 1: every subject of an explicit rdf:type triple must be an IRI.",
+            "# (Catches literals accidentally used as subjects, blank-node subjects, etc.)",
+            "[] a sh:NodeShape ;",
+            "   sh:targetSubjectsOf rdf:type ;",
+            "   sh:nodeKind sh:IRI .",
+            "",
+            "# Rule 2: every rdf:type value (the class) must itself be an IRI.",
+            "# (Catches  ?s rdf:type \"SomeString\"  mistakes.)",
+            "[] a sh:NodeShape ;",
+            "   sh:targetSubjectsOf rdf:type ;",
+            "   sh:property [",
+            "     sh:path rdf:type ;",
+            "     sh:nodeKind sh:IRI ;",
+            "   ] .",
+        ])
+        with open(shapes_path, "w") as _sf:
+            _sf.write(shapes_ttl)
+        print("    [SHACL] Using fallback structural shapes (Astrea unavailable)")
+
+    # ── Step 2: Run pyshacl ───────────────────────────────────────────
+    # CRITICAL: inference must be "none".
+    #
+    # With inference="rdfs", pyshacl's RDFS reasoner fires rule rdfs4b:
+    #   if ?x ?p ?y and ?y is a typed literal then infer ?y rdf:type dtype
+    # This creates  "1916"^^xsd:gYear  rdf:type  xsd:gYear  etc. for every
+    # typed literal in the KG.  The fallback shape sh:targetSubjectsOf rdf:type
+    # then targets those literals and flags them as NodeKind violations —
+    # all false positives on a perfectly valid KG.
+    # inference="none" evaluates only explicit triples in the data graph.
+    try:
+        _conforms, _results_graph, _results_text = _shacl_validate(
+            data_graph=rdf_path,
+            shacl_graph=shapes_path,
+            data_graph_format="ntriples",
+            shacl_graph_format="turtle",
+            inference="none",
+            abort_on_first=False,
+        )
+    except Exception as _e:
+        return {
+            "feedback": f"SHACL_ERROR: Validation exception: {_e}",
+            "messages": [f"[SHACL] Validation exception: {_e}"],
+        }
+
+    # Save full report
+    report_path = os.path.join(run_dir, "shacl_report.txt")
+    with open(report_path, "w") as _rf:
+        _rf.write(_results_text)
+
+    if _conforms:
+        print("    [SHACL] ✓ KG conforms to all shapes")
+        return {
+            "feedback": "SHACL_PASSED",
+            "messages": ["[SHACL] KG conforms to all SHACL shapes"],
+        }
+
+    # ── Step 3: Parse violations → structured feedback ────────────────
+    _violations = _parse_shacl_violations(_results_text)
+    print(f"    [SHACL] ✗ {len(_violations)} unique violation type(s) found")
+    for _v in _violations[:5]:
+        print(f"      - {_v[:100]}")
+
+    _fb_lines = [
+        "SHACL_ERROR: SHACL VIOLATIONS DETECTED",
+        f"  {len(_violations)} unique constraint violation type(s) found in the generated KG.",
+        "  Revise the YARRRML mapping so the KG satisfies the ontology constraints.",
+        "  Key violations (deduplicated):",
+    ]
+    for _v in _violations[:8]:
+        _fb_lines.append(f"    • {_v[:120]}")
+
+    return {
+        "feedback": "\n".join(_fb_lines),
+        "messages": [f"[SHACL] {len(_violations)} violation type(s) — routing back to YARRRML generator"],
+    }
+
+
+
+
+
 

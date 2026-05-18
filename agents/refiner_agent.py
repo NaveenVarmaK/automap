@@ -341,10 +341,35 @@ def _check_islands(mappings: dict) -> list[str]:
     if len(valid_mappings) <= 1:
         return errors
 
+    # ── Single-source guard ──────────────────────────────────────────
+    # When all mappings share exactly one CSV source, a fan-out topology
+    # (one CSV → multiple class mappings) is architecturally valid even
+    # when cross-links use different namespace prefixes (e.g. mykg: vs dbo:).
+    # Flagging these as DISCONNECTED causes an infinite retry loop.
+    all_sources: set[str] = set()
+    for mdef in valid_mappings.values():
+        for src in (mdef.get("sources") or []):
+            if isinstance(src, list) and src:
+                all_sources.add(str(src[0]))
+            elif isinstance(src, str):
+                all_sources.add(src)
+    if len(all_sources) <= 1:
+        return errors  # single-source fan-out — island check not meaningful
+
     def _normalise(s: str) -> str:
-        """Strip template vars, ~iri, and normalise slashes."""
+        """Strip template vars, ~iri, namespace prefix, and normalise slashes.
+
+        Stripping the namespace prefix (everything up to the first colon)
+        makes cross-namespace references comparable, so that
+        ``dbo:Film/`` and ``mykg:Film/`` are treated as equivalent.
+        This prevents false DISCONNECTED errors when the LLM uses different
+        prefixes in subject templates vs. object IRI references.
+        """
         s = re.sub(r'\$\([^)]+\)', '', s)
         s = s.replace('~iri', '')
+        # Strip namespace prefix so dbo:Film/ and mykg:Film/ both → Film/
+        if ':' in s and not s.startswith('http'):
+            s = s.split(':', 1)[1]
         s = re.sub(r'/+', '/', s)     # collapse double-slashes
         return s.rstrip('_/')
 

@@ -43,3 +43,4 @@ class AgentState(TypedDict):
     persistent_cq_failures: list          # CQ failure dicts {cq, sparql, diagnosis} from SPARQL validation
     _prev_entity_plan: str                 # entity plan from previous alignment run (for prefix cache diff)
     injected_column_constraints: dict      # {col → "pred (dtype) in MappingName"} from refiner auto-inject
+    shacl_enabled: bool                    # True when --shacl flag was passed

@@ -11,8 +11,10 @@ from graph.nodes import (
     kg_generation_node,
     sparql_cq_validator_node,
     generate_cqs_node,
+    shacl_validation_node,
 )
 from langgraph.checkpoint.memory import MemorySaver
+import os
 
 
 def build_rml_graph():
@@ -28,6 +30,7 @@ def build_rml_graph():
     workflow.add_node("validate_yarrrml", validation_node)
     workflow.add_node("refine_logic", refiner_agent_node)
     workflow.add_node("generate_kg", kg_generation_node)
+    workflow.add_node("shacl_validate", shacl_validation_node)
     # Deterministic SPARQL-based CQ validation on the materialized KG
     workflow.add_node("sparql_validate_cqs", sparql_cq_validator_node)
 
@@ -50,11 +53,26 @@ def build_rml_graph():
             return "generate_yarrrml"
         return "generate_kg"
 
+    def shacl_routing(state):
+        """Route after SHACL validation.
+
+        - If --shacl was not requested (shacl_enabled=False), pass through immediately.
+        - On violations (SHACL_ERROR), retry YARRRML generation (capped via retry_count).
+        - On SHACL_PASSED or SHACL_SKIP, continue to SPARQL CQ validation.
+        """
+        fb = state.get("feedback", "")
+        retries = state.get("retry_count", 0)
+        if "SHACL_ERROR" in fb:
+            if retries >= 10:
+                # Retry cap reached — accept current KG and move on
+                return "sparql_validate_cqs"
+            return "generate_yarrrml"
+        return "sparql_validate_cqs"
+
     def sparql_cq_routing(state):
         """Route after SPARQL-based CQ validation on the materialized KG."""
         feedback = state.get("feedback", "")
         cq_sparql_retries = state.get("cq_sparql_retry_count", 0)
-        import os
         max_retries = int(os.environ.get("CQ_SPARQL_MAX_RETRIES", "3"))
 
         if "CQ_SPARQL_ERROR" in feedback:
@@ -94,8 +112,17 @@ def build_rml_graph():
         {"generate_yarrrml": "generate_yarrrml", "generate_kg": "generate_kg", "__end__": END}
     )
 
-    # After KG generation → SPARQL-based CQ validation
-    workflow.add_edge("generate_kg", "sparql_validate_cqs")
+    # After KG generation → SHACL validation (zero-cost passthrough when --shacl not set)
+    workflow.add_edge("generate_kg", "shacl_validate")
+
+    workflow.add_conditional_edges(
+        "shacl_validate",
+        shacl_routing,
+        {
+            "generate_yarrrml": "generate_yarrrml",
+            "sparql_validate_cqs": "sparql_validate_cqs",
+        }
+    )
 
     workflow.add_conditional_edges(
         "sparql_validate_cqs",
