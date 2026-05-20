@@ -460,7 +460,6 @@ SPARQL --> [*]: pass/skip</div></div>
           <div class="card"><h4>Column coverage</h4><p>Extracts all referenced <code>$(columns)</code>, compares against CSV headers, and ignores known-empty columns via cached checks.</p></div>
           <div class="card"><h4>Prefix auto-fix</h4><p>Resolves missing declarations from ontology prefixes or a known-prefix table without consuming a retry slot.</p></div>
           <div class="card"><h4>IRI validation</h4><p>Ensures URL-valued columns use <code>~iri</code> rather than literal mapping treatment.</p></div>
-          <div class="card"><h4>FK validation</h4><p>Verifies same-CSV foreign keys use URI templates instead of invalid join patterns.</p></div>
           <div class="card"><h4>Syntax normalization</h4><p>Accepts and normalizes brace-style templates and composite key patterns before the LLM sees them.</p></div>
           <div class="card"><h4>Constraint injection</h4><p>On logic failure, the next retry receives per-column predicate and mapping constraints from the refiner.</p></div>
         </div>
