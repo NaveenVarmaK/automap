@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Automap — Slide Deck v2</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700,900&f[]=cabinet-grotesk@500,700,800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg:#f6f8fc; --bg2:#eef3fb; --surface:#ffffff; --surface2:#f5f7fb; --surface3:#eaf0f8;
+      --border:rgba(15,23,42,.10); --muted:#64748b; --text:#0f172a; --soft:#334155;
+      --accent:#2563eb; --accent2:#059669; --accent3:#d97706; --accent4:#7c3aed; --danger:#dc2626;
+      --shadow:0 18px 60px rgba(15,23,42,.10);
+      --radius:24px; --radius-sm:16px;
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    html,body{height:100%;scroll-behavior:smooth}
+    body{
+      font-family:'Satoshi',system-ui,sans-serif; background:radial-gradient(circle at top left,#ffffff 0%,var(--bg) 42%,#e9f0fb 100%);
+      color:var(--text); overflow:hidden;
+    }
+    button,a{font:inherit}
+    .deck{height:100vh; overflow:auto; scroll-snap-type:y mandatory;}
+    .slide{
+      min-height:100vh; scroll-snap-align:start; padding:28px 32px 88px; position:relative;
+      display:grid; grid-template-rows:auto auto 1fr; gap:18px;
+      border-bottom:1px solid rgba(255,255,255,.05);
+      content-visibility:auto;
+    }
+    .slide::before{
+      content:''; position:absolute; inset:16px; border-radius:32px;
+      background:linear-gradient(180deg,rgba(255,255,255,.96),rgba(246,248,252,.96));
+      border:1px solid rgba(15,23,42,.08); box-shadow:var(--shadow); z-index:0;
+    }
+    .slide > *{position:relative; z-index:1}
+    .topbar{display:flex; justify-content:space-between; align-items:center; gap:16px}
+    .brand{display:flex; align-items:center; gap:14px}
+    .logo{
+      width:46px;height:46px;border-radius:14px; display:grid; place-items:center; font-weight:900;
+      background:linear-gradient(135deg,var(--accent),var(--accent2)); color:white;
+      box-shadow:0 10px 30px rgba(96,165,250,.3);
+    }
+    .brand h1,.title{font-family:'Cabinet Grotesk',sans-serif; letter-spacing:-.02em}
+    .brand h1{font-size:1.15rem}
+    .meta{color:var(--muted); font-size:.9rem}
+    .chip-row{display:flex; flex-wrap:wrap; gap:10px}
+    .chip{padding:7px 12px; border:1px solid rgba(255,255,255,.08); border-radius:999px; background:rgba(37,99,235,.06); color:var(--soft); font-size:.78rem; font-weight:700}
+    .chip.blue{color:var(--accent)} .chip.green{color:var(--accent2)} .chip.orange{color:var(--accent3)} .chip.purple{color:var(--accent4)}
+    .slide-header{display:grid; grid-template-columns:110px 1fr; gap:18px; align-items:start}
+    .slide-num{
+      width:92px; height:92px; border-radius:28px; display:grid; place-items:center; font-size:2rem; font-weight:900;
+      background:linear-gradient(135deg,rgba(37,99,235,.10),rgba(5,150,105,.08)); color:var(--text);
+      border:1px solid rgba(15,23,42,.08);
+    }
+    .title{font-size:clamp(2rem,4vw,3.5rem); line-height:.96; font-weight:800}
+    .subtitle{font-size:1.02rem; color:var(--muted); max-width:90ch; margin-top:8px}
+    .content{display:grid; gap:18px; min-height:0}
+    .cols-2{grid-template-columns:1.2fr .8fr}
+    .cols-eq{grid-template-columns:1fr 1fr}
+    .cols-3{grid-template-columns:repeat(3,1fr)}
+    .panel{
+      background:linear-gradient(180deg,rgba(255,255,255,.98),rgba(248,250,252,.98));
+      border:1px solid var(--border); border-radius:var(--radius); padding:18px; min-width:0;
+    }
+    .panel h3{font-size:1.05rem; color:var(--accent); margin-bottom:10px}
+    .panel h4{font-size:.95rem; color:var(--soft); margin-bottom:8px}
+    p{color:var(--soft); line-height:1.5}
+    ul{padding-left:18px; color:var(--soft)}
+    li{margin:.25rem 0}
+    .kpi-grid,.mini-grid,.card-grid{display:grid; gap:14px}
+    .kpi-grid{grid-template-columns:repeat(4,1fr)}
+    .mini-grid{grid-template-columns:repeat(2,1fr)}
+    .card-grid{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+    .card{
+      background:rgba(241,245,249,.95); border:1px solid rgba(15,23,42,.08);
+      border-radius:20px; padding:14px;
+    }
+    .card h4{color:var(--text); font-size:.95rem; margin-bottom:6px}
+    .card p,.card li{font-size:.9rem}
+    .eyebrow{font-size:.74rem; text-transform:uppercase; letter-spacing:.14em; color:var(--muted); margin-bottom:8px; font-weight:800}
+    .stat{font-size:1.9rem; font-weight:900; color:var(--text); font-family:'Cabinet Grotesk',sans-serif}
+    .stat-label{font-size:.8rem; color:var(--muted)}
+    .diagram{
+      background:linear-gradient(180deg,rgba(37,99,235,.05),rgba(5,150,105,.03));
+      border:1px solid rgba(37,99,235,.12); border-radius:24px; padding:16px; min-height:220px;
+    }
+    .flow-rail{display:grid; gap:10px}
+    .flow-step{display:grid; grid-template-columns:46px 1fr; gap:12px; align-items:start; padding:12px; border-radius:18px; background:rgba(255,255,255,.035); border:1px solid rgba(255,255,255,.07)}
+    .flow-step .n{width:46px;height:46px;border-radius:14px;display:grid;place-items:center;font-weight:900;color:#08111f;background:linear-gradient(135deg,var(--accent),var(--accent2))}
+    .arrowline{height:18px; width:2px; background:linear-gradient(var(--accent),var(--accent2)); margin:0 auto}
+    .two-tone{display:grid; grid-template-columns:1fr 1fr; gap:14px}
+    .tone{padding:16px; border-radius:20px; border:1px solid rgba(255,255,255,.08)}
+    .tone.blue{background:rgba(37,99,235,.08)} .tone.green{background:rgba(5,150,105,.08)} .tone.orange{background:rgba(217,119,6,.08)} .tone.purple{background:rgba(124,58,237,.08)} .tone.red{background:rgba(220,38,38,.07)}
+    pre{
+      background:#f8fafc; color:#0f172a; border:1px solid rgba(15,23,42,.08); border-radius:18px;
+      padding:14px; overflow:auto; font-size:.76rem; line-height:1.45; white-space:pre-wrap;
+    }
+    code{background:rgba(255,255,255,.07); padding:.15rem .4rem; border-radius:8px; color:#a11f29}
+    table{width:100%; border-collapse:separate; border-spacing:0; font-size:.83rem; overflow:hidden; border-radius:18px; border:1px solid rgba(255,255,255,.08)}
+    th,td{padding:10px 12px; text-align:left; vertical-align:top}
+    th{background:rgba(37,99,235,.10); color:var(--text); font-size:.78rem; text-transform:uppercase; letter-spacing:.08em}
+    tr:nth-child(even) td{background:rgba(241,245,249,.9)}
+    tr:nth-child(odd) td{background:rgba(255,255,255,.98)}
+    .pill{display:inline-block; padding:5px 10px; border-radius:999px; font-size:.74rem; font-weight:800; margin:4px 6px 0 0}
+    .pill.b{background:rgba(96,165,250,.14); color:var(--accent)} .pill.g{background:rgba(52,211,153,.14); color:var(--accent2)} .pill.o{background:rgba(245,158,11,.14); color:var(--accent3)} .pill.p{background:rgba(192,132,252,.16); color:var(--accent4)} .pill.r{background:rgba(220,38,38,.12); color:var(--danger)}
+    .nav-dots{position:fixed; right:24px; top:50%; transform:translateY(-50%); display:grid; gap:8px; z-index:40}
+    .dot{width:10px;height:10px;border-radius:999px;background:rgba(255,255,255,.25); border:none; cursor:pointer}
+    .dot.active{background:var(--accent); box-shadow:0 0 0 4px rgba(96,165,250,.15)}
+    .corner-nav{position:fixed; right:24px; bottom:20px; display:flex; gap:10px; z-index:50}
+    .nav-btn{
+      width:56px;height:56px;border-radius:18px; border:1px solid rgba(255,255,255,.10); background:rgba(96,165,250,.3); color:var(--text);
+      display:grid; place-items:center; cursor:pointer; box-shadow:var(--shadow); backdrop-filter:blur(10px);
+    }
+    .nav-btn:hover{background:rgba(239,246,255,.98)}
+    .slide-jump{
+      position:fixed; left:24px; bottom:20px; z-index:50; display:flex; align-items:center; gap:12px;
+      background:rgba(96,165,250,.3); border:1px solid rgba(255,255,255,.1); border-radius:18px; padding:10px 14px; box-shadow:var(--shadow)
+    }
+    .slide-jump select{background:#ffffff; color:var(--text); border:1px solid rgba(15,23,42,.12); border-radius:12px; padding:8px 12px}
+    .foot{display:flex; justify-content:space-between; align-items:center; gap:12px; color:var(--muted); font-size:.82rem; margin-top:auto}
+    .mermaid{display:flex; justify-content:center}
+    .tight p,.tight li{font-size:.88rem}
+    .hero-title{font-family:'Cabinet Grotesk',sans-serif; font-size:clamp(3rem,8vw,6rem); line-height:.92; letter-spacing:-.04em}
+    .hero-gradient{background:linear-gradient(90deg,#1d4ed8,#2563eb,#059669,#7c3aed); -webkit-background-clip:text; background-clip:text; color:transparent}
+    @media (max-width: 1100px){ .cols-2,.cols-eq,.cols-3,.kpi-grid,.mini-grid,.two-tone{grid-template-columns:1fr} .slide{padding:22px 20px 96px} .slide-header{grid-template-columns:72px 1fr} .slide-num{width:72px;height:72px;font-size:1.4rem} .nav-dots{display:none} }
+
+    /* ── Evaluation slide extras ── */
+    :root { --teal:#0891b2; }
+    .chip.teal{color:var(--teal);background:rgba(8,145,178,.06);border-color:rgba(8,145,178,.2)}
+    .validation-banner{background:linear-gradient(90deg,rgba(5,150,105,.08),rgba(37,99,235,.04));border:1px solid rgba(5,150,105,.22);border-radius:16px;padding:12px 18px;display:flex;align-items:flex-start;gap:12px}
+    .validation-banner .vicon{font-size:1.3rem;flex-shrink:0;margin-top:1px}
+    .validation-banner .vtxt{font-size:.84rem;color:var(--soft);line-height:1.5}
+    .validation-banner .vtxt strong{color:var(--accent2)}
+    .ev-sec-label{font-family:'Cabinet Grotesk',sans-serif;font-size:.78rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);padding:6px 0 4px;border-bottom:2px solid var(--border);margin-bottom:4px}
+    .tbl-outer{border-radius:18px;border:1px solid var(--border);overflow:hidden}
+    .ev-table{width:100%;border-collapse:collapse;font-size:.78rem}
+    .ev-table thead th{padding:8px 11px;text-align:center;font-size:.67rem;text-transform:uppercase;letter-spacing:.08em;font-weight:800;vertical-align:bottom;line-height:1.3;border-bottom:2px solid var(--border)}
+    .ev-table thead th.mc{text-align:left;background:rgba(37,99,235,.05)}
+    .ev-table thead .th-ref {background:rgba(217,119,6,.06);color:var(--accent3)}
+    .ev-table thead .th-ref2{background:rgba(5,150,105,.07);color:var(--accent2)}
+    .ev-table thead .th-our {background:rgba(37,99,235,.06);color:var(--accent);border-left:2px solid rgba(15,23,42,.15)}
+    .ev-table thead .th-ourb{background:rgba(124,58,237,.06);color:var(--accent4)}
+    .ev-table thead .th-ds{background:linear-gradient(160deg,rgba(8,145,178,.12),rgba(8,145,178,.05));color:var(--teal);position:relative}
+    .ev-table thead .th-ds::after{content:'NEW ✦';position:absolute;top:4px;right:5px;font-size:.54rem;background:var(--teal);color:#fff;padding:1px 4px;border-radius:4px;font-weight:900;letter-spacing:.05em}
+    .ev-table tbody td{padding:6px 11px;border-bottom:1px solid rgba(15,23,42,.05);vertical-align:middle;color:var(--soft)}
+    .ev-table tbody tr:last-child td{border-bottom:none}
+    .ev-table tbody tr:nth-child(even) td{background:rgba(241,245,249,.55)}
+    .ev-table tbody tr:nth-child(odd) td{background:rgba(255,255,255,.9)}
+    .ev-table tr.ev-sec-row td{background:rgba(37,99,235,.04)!important;font-size:.65rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);padding:4px 11px;border-top:2px solid rgba(15,23,42,.08)}
+    tr.avg-row td{border-top:2px solid rgba(15,23,42,.12)!important;font-weight:800;background:rgba(241,245,249,.98)!important;font-size:.82rem}
+    .mc{text-align:left!important;color:var(--text)!important;font-weight:600;min-width:180px}
+    .vc{text-align:center;font-family:'Cabinet Grotesk',sans-serif;font-weight:800;font-size:.8rem;white-space:nowrap}
+    .vc-ref {color:var(--accent3)}
+    .vc-ref2{color:var(--accent2)}
+    .vc-our {color:var(--accent);border-left:2px solid rgba(15,23,42,.12)!important}
+    .vc-ourb{color:var(--accent4)}
+    .vc-ds{color:var(--teal);background:rgba(8,145,178,.04)!important}
+    .vc-m{color:var(--muted)!important}
+    .ev-bar{display:flex;align-items:center;justify-content:center;gap:4px}
+    .ev-bg{width:34px;height:4px;background:rgba(15,23,42,.08);border-radius:2px;overflow:hidden;flex-shrink:0}
+    .ev-bf{height:100%;border-radius:2px}
+    .bf-o{background:var(--accent3)}.bf-g{background:var(--accent2)}.bf-b{background:var(--accent)}.bf-p{background:var(--accent4)}.bf-t{background:var(--teal)}.bf-r{background:var(--danger)}
+    .ed{font-size:.62rem;font-weight:900;padding:1px 5px;border-radius:4px;white-space:nowrap;font-family:'Cabinet Grotesk',sans-serif}
+    .edp{background:rgba(5,150,105,.12);color:var(--accent2)}.edn{background:rgba(220,38,38,.09);color:var(--danger)}.edz{background:rgba(15,23,42,.07);color:var(--muted)}
+    .esb{display:inline-flex;align-items:center;justify-content:center;font-family:'Cabinet Grotesk',sans-serif;font-weight:800;font-size:.74rem;min-width:26px;padding:2px 5px;border-radius:5px;white-space:nowrap}
+    .esb-y{background:rgba(5,150,105,.12);color:var(--accent2)}.esb-n{background:rgba(220,38,38,.09);color:var(--danger)}.esb-v{background:rgba(37,99,235,.08);color:var(--accent)}.esb-t{background:rgba(8,145,178,.12);color:var(--teal)}
+    .triple-row{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
+    .tcard{border-radius:14px;border:1px solid var(--border);padding:11px 12px;text-align:center;background:rgba(248,250,252,.9)}
+    .tcard.tc-hl{background:linear-gradient(160deg,rgba(8,145,178,.1),rgba(8,145,178,.04));border-color:rgba(8,145,178,.35);border-width:2px}
+    .tcard .tv{font-family:'Cabinet Grotesk',sans-serif;font-size:1.5rem;font-weight:900}
+    .tcard .tl{font-size:.66rem;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-top:2px}
+    .tcard .tn{font-size:.7rem;color:var(--soft);margin-top:3px;font-weight:600}
+    .tv-o{color:var(--accent3)}.tv-g{color:var(--accent2)}.tv-b{color:var(--accent)}.tv-p{color:var(--accent4)}.tv-t{color:var(--teal)}
+  </style>
+</head>
+<body>
+  <div class="nav-dots" id="navDots"></div>
+  <div class="slide-jump">
+    <span style="color:var(--muted);font-size:.84rem">Slide</span>
+    <select id="slideSelect"></select>
+  </div>
+  <div class="corner-nav">
+    <button class="nav-btn" id="prevBtn" aria-label="Previous slide">←</button>
+    <button class="nav-btn" id="nextBtn" aria-label="Next slide">→</button>
+  </div>
+
+  <main class="deck" id="deck">
+
+    <!-- ═══════════════════════════════════════════════════════ SLIDE 1 — Overview -->
+    <section class="slide" data-title="Overview">
+      <div class="topbar">
+        <div class="brand"><div class="logo">A</div><div><h1>Automap</h1><div class="meta">Agentic knowledge graph generation from CSV + ontology</div></div></div>
+        <div class="chip-row">
+          <span class="chip blue">LangGraph</span><span class="chip green">Morph-KGC</span><span class="chip purple">YARRRML → RML</span><span class="chip orange">LM Studio</span>
+        </div>
+      </div>
+      <div class="content cols-2" style="align-items:center">
+        <div class="panel" style="padding:28px; min-height:72vh; display:grid; align-content:center; gap:18px">
+          <div class="eyebrow">Universidad Politécnica de Madrid · PIONERA Project</div>
+          <div class="hero-title hero-gradient">Automap</div>
+          <p style="font-size:1.18rem; max-width:60ch">A multi-agent pipeline that transforms CSV data and ontologies into validated knowledge graphs — now with auto-generated CQs, SPARQL execution validation, and optional SHACL conformance checking.</p>
+          <div class="kpi-grid">
+            <div class="card"><div class="stat">12</div><div class="stat-label">Pipeline nodes</div></div>
+            <div class="card"><div class="stat">4</div><div class="stat-label">Feedback loops</div></div>
+            <div class="card"><div class="stat">100%</div><div class="stat-label">Local-LLM capable</div></div>
+          </div>
+        </div>
+        <div class="diagram panel" style="min-height:72vh; display:grid; align-content:center; gap:14px">
+          <div class="eyebrow">Pipeline at a glance</div>
+          <div class="flow-rail">
+            <div class="flow-step"><div class="n">1</div><div><strong>Understand</strong><p>Analyze CSV structure and ontology vocabulary.</p></div></div>
+            <div class="arrowline"></div>
+            <div class="flow-step"><div class="n">2</div><div><strong>Plan</strong><p>Map semantics, generate CQs, and build the entity plan.</p></div></div>
+            <div class="arrowline"></div>
+            <div class="flow-step"><div class="n">3</div><div><strong>Generate</strong><p>Assemble YARRRML through specialized sub-agents.</p></div></div>
+            <div class="arrowline"></div>
+            <div class="flow-step"><div class="n">4</div><div><strong>Validate</strong><p>Syntax → Logic → KG → SHACL → SPARQL CQ execution.</p></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ SLIDE 2 — Tech Stack -->
+    <section class="slide" data-title="Tech Stack">
+      <div class="slide-header"><div class="slide-num">2</div><div><div class="title">Technology Stack</div><p class="subtitle">Each layer owns one clear responsibility. The platform supports fully local execution while keeping the option for cloud-scale models.</p></div></div>
+      <div class="content cols-2">
+        <div class="panel">
+          <table>
+            <thead><tr><th>Layer</th><th>Technology</th><th>Role</th></tr></thead>
+            <tbody>
+              <tr><td>Orchestration</td><td>LangGraph StateGraph</td><td>Directed multi-agent graph, conditional routing, memory checkpoints</td></tr>
+              <tr><td>LLM Interface</td><td>LangChain + langchain-openai</td><td>LM Studio (local) or Comet AI (cloud)</td></tr>
+              <tr><td>Mapping</td><td>YARRRML + Yatter</td><td>Human-readable mapping authoring → RML translation</td></tr>
+              <tr><td>Materialization</td><td>Morph-KGC</td><td>Executes RML mappings against CSV, emits N-Triples</td></tr>
+              <tr><td>CQ Validation</td><td>pyoxigraph + LangChain</td><td>CQ→SPARQL ASK translation then execution on the live KG</td></tr>
+              <tr><td>SHACL</td><td>Astrea + pyshacl</td><td>Auto-derives shapes from ontology; validates KG conformance</td></tr>
+              <tr><td>Ontology Parsing</td><td>RDFLib</td><td>Classes, properties, prefixes, domain/range extraction</td></tr>
+              <tr><td>Dashboard</td><td>Streamlit + Plotly</td><td>Run comparison and metrics visualization</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="mini-grid">
+          <div class="card"><div class="eyebrow">Default model</div><h4><code>qwen2.5-coder-14b-instruct</code></h4><p>Code-specialized and configurable per role via environment variables.</p></div>
+          <div class="card"><div class="eyebrow">Structured mode</div><p>With <code>STRUCTURED_OUTPUT=true</code>, JSON-schema-enforced outputs make many YAML syntax failures structurally impossible.</p></div>
+          <div class="diagram card" style="grid-column:1/-1">
+            <div class="eyebrow">Stack relationship</div>
+            <div class="two-tone">
+              <div class="tone blue"><h4>Generation path</h4><p>CSV + ontology → agents → YARRRML → Yatter → RML → Morph-KGC → KG</p></div>
+              <div class="tone green"><h4>Validation path</h4><p>KG → SHACL (Astrea shapes) → SPARQL CQ execution → structured feedback → regenerate</p></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ SLIDE 3 — Architecture -->
+    <section class="slide" data-title="Architecture">
+      <div class="slide-header"><div class="slide-num">3</div><div><div class="title">12-Node LangGraph Architecture</div><p class="subtitle">A single typed state machine with deterministic edges, four conditional feedback loops, and explicit hard-stop conditions at every gate.</p></div></div>
+      <div class="content cols-2">
+        <div class="panel diagram">
+          <div class="mermaid">
+flowchart TD
+    A([CSV + Ontology]) --> N1[analyze_schema]
+    N1 --> N2[scout_ontology]
+    N2 --> N3[map_semantics]
+    N3 --> N4[align_schema]
+    N4 --> N5[generate_cqs]
+    N5 --> N6[generate_yarrrml]
+    N6 --> N7{validate_yarrrml}
+    N7 -->|Syntax error| N6
+    N7 -->|Passed| N8{refine_logic}
+    N8 -->|Logic error| N6
+    N8 -->|Approved| N9[generate_kg]
+    N9 --> N10{shacl_validate}
+    N10 -->|SHACL error| N6
+    N10 -->|Pass/Skip| N11{sparql_validate_cqs}
+    N11 -->|CQ fail| N6
+    N11 -->|CQ deep fail| N4
+    N11 -->|Pass/Skip| O([Knowledge Graph])
+          </div>
+        </div>
+        <div class="panel tight">
+          <div class="flow-rail">
+            <div class="flow-step"><div class="n">1–3</div><div><strong>Understand</strong><p><code>analyze_schema</code> → <code>scout_ontology</code> → <code>map_semantics</code>: CSV structure, ontology vocabulary, semantic column mapping.</p></div></div>
+            <div class="flow-step"><div class="n">4–5</div><div><strong>Plan</strong><p><code>align_schema</code> builds the functional entity plan. <code>generate_cqs</code> auto-generates Competency Questions (or uses user-provided ones).</p></div></div>
+            <div class="flow-step"><div class="n">6–8</div><div><strong>Generate + Syntax + Logic</strong><p>YARRRML coordinator → Yatter syntax check → Refiner logic check. Both loops feed back into generation.</p></div></div>
+            <div class="flow-step"><div class="n">9–12</div><div><strong>Materialize + Validate</strong><p>Morph-KGC produces N-Triples. SHACL shapes (via Astrea) check conformance. SPARQL ASK queries execute each CQ on the live KG.</p></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ SLIDE 4 — Agents -->
+    <section class="slide" data-title="Agents">
+      <div class="slide-header"><div class="slide-num">4</div><div><div class="title">Agent Breakdown</div><p class="subtitle">Each agent owns a narrow, explicit responsibility. Static system prompts stay cache-friendly; retry feedback enters only through the human message.</p></div></div>
+      <div class="content">
+        <div class="card-grid">
+          <div class="card"><h4>Schema Agent</h4><p>CSV interpretation, entity guess, primary keys, foreign keys, column semantics.</p></div>
+          <div class="card"><h4>Ontology Scout</h4><p>No LLM call. Deterministic RDFLib extraction of classes, prefixes, and property hierarchy.</p></div>
+          <div class="card"><h4>Mapper Agent</h4><p>Links each column to a real ontology URI and lists required prefixes.</p></div>
+          <div class="card"><h4>Schema Alignment Agent</h4><p>Builds the functional entity plan, multi-node structure, and retry-aware replanning.</p></div>
+          <div class="card"><h4>CQ Generator</h4><p>Auto-generates Competency Questions from schema + entity plan when no user CQs are provided.</p></div>
+          <div class="card"><h4>YARRRML Coordinator</h4><p>Orchestrates prefix, entity, and relationship agents plus deterministic post-processing.</p></div>
+          <div class="card"><h4>Refiner Agent</h4><p>Column coverage, prefix auto-fix, IRI and FK validation, constraint injection on failure.</p></div>
+          <div class="card"><h4>CQ→SPARQL Agent</h4><p>Translates each CQ to a SPARQL ASK query grounded in YARRRML prefixes and live KG types. Self-corrects on parse errors.</p></div>
+          <div class="card"><h4>SHACL Validator</h4><p>Derives shapes from the ontology via Astrea; runs pyshacl against the KG; returns structured violation feedback.</p></div>
+        </div>
+        <div class="two-tone">
+          <div class="tone purple"><h4>Why this decomposition works</h4><ul><li>Shorter prompts → lower hallucination pressure.</li><li>Clearer failure attribution per node.</li><li>Better retry targeting on specific errors.</li></ul></div>
+          <div class="tone orange"><h4>What's new vs. previous version</h4><ul><li>CQ Generator auto-creates validation targets.</li><li>CQ→SPARQL agent executes checks on the actual KG.</li><li>SHACL node is dataset-agnostic (ontology-derived shapes).</li></ul></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ SLIDE 5 — CQ Pipeline -->
+    <section class="slide" data-title="CQ Pipeline">
+      <div class="slide-header"><div class="slide-num">5</div><div><div class="title">Competency Question Pipeline</div><p class="subtitle">CQs serve two roles: they guide YARRRML generation toward the intended semantic structure, then act as executable validation targets on the materialized KG.</p></div></div>
+      <div class="content cols-2">
+        <div class="panel diagram">
+          <div class="flow-rail">
+            <div class="flow-step"><div class="n">In</div><div><strong>CQ Source</strong><p>User-provided via <code>--cqs</code> flag, or auto-generated from schema + entity plan.</p></div></div>
+            <div class="arrowline"></div>
+            <div class="flow-step"><div class="n">1</div><div><strong>CQ Generator Agent</strong><p>Produces 5–10 questions covering entity existence, attributes, and relationships. Grounded to actual entity types in the plan.</p></div></div>
+            <div class="arrowline"></div>
+            <div class="flow-step"><div class="n">2</div><div><strong>Generation guidance</strong><p>CQs injected into YARRRML coordinator prompt to bias entity and predicate choices.</p></div></div>
+            <div class="arrowline"></div>
+            <div class="flow-step"><div class="n">3</div><div><strong>CQ → SPARQL Agent</strong><p>Each CQ translated to an ASK query, grounded in YARRRML prefixes and live KG probe results. Self-corrects on parse errors.</p></div></div>
+            <div class="arrowline"></div>
+            <div class="flow-step"><div class="n">4</div><div><strong>SPARQL Execution</strong><p>ASK queries run against the materialized KG via pyoxigraph. Failures trigger structured feedback with exact triple patterns.</p></div></div>
+          </div>
+        </div>
+        <div class="panel tight">
+          <div class="card-grid">
+            <div class="card"><h4>Three input modes</h4><ul><li><code>--cqs "..."</code> — user natural-language CQs (translated by LLM)</li><li><code>--sparql-queries "ASK {...}"</code> — direct SPARQL (no LLM)</li><li>Auto-generated — triggered when no CQs are provided</li></ul></div>
+            <div class="card"><h4>KG-grounded translation</h4><p>Before translating CQs, the agent probes the live KG for actual classes and predicates. Prevents writing <code>?s a schema:Order</code> when only <code>schema:OrderItem</code> exists.</p></div>
+            <div class="card"><h4>Retry routing</h4><ul><li>Retries 0–1 → regenerate YARRRML with targeted fix</li><li>Retries ≥ 2 → escalate to schema re-alignment</li><li>Cap at <code>CQ_SPARQL_MAX_RETRIES</code></li></ul></div>
+            <div class="card"><h4>Diagnosis feedback</h4><p>On failure, the exact failing triple patterns and SELECT probe diagnostics are injected into the next generation prompt.</p></div>
+          </div>
+          <pre style="margin-top:12px"># Example generated CQ
+"Which transactions are linked to a merchant?"
+
+# Resulting SPARQL ASK
+PREFIX ex: &lt;http://example.org/&gt;
+ASK {
+  ?t a ex:CreditCardTransaction ;
+     ex:atMerchant ?m .
+  ?m a ex:Merchant .
+}</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ SLIDE 6 — Self-Correction -->
+    <section class="slide" data-title="Self-Correction">
+      <div class="slide-header"><div class="slide-num">6</div><div><div class="title">4-Layer Self-Correction Loop</div><p class="subtitle">Errors are intercepted from cheapest to most expensive. Each layer feeds back precise, actionable constraints rather than generic criticism.</p></div></div>
+      <div class="content" style="grid-template-columns:repeat(4,1fr); gap:14px">
+        <div class="panel tone blue"><h3>Layer 1 — Syntax</h3><ul><li>Yatter translation is deterministic.</li><li>Broken YARRRML + traceback injected into next prompt.</li><li>Auto-repair tries common fixes before full regeneration.</li><li>Hard stop at 10 retries.</li></ul></div>
+        <div class="panel tone green"><h3>Layer 2 — Logic</h3><ul><li>Deterministic checks first: column coverage, IRI flags, FK patterns, prefix declarations.</li><li>LLM critique only for ambiguous cases.</li><li>Non-actionable feedback filtered out.</li><li>Hard stop at 6 retries.</li></ul></div>
+        <div class="panel tone orange"><h3>Layer 3 — SHACL</h3><ul><li>Astrea derives shapes from ontology automatically.</li><li>pyshacl validates materialized KG.</li><li>Deduplicated violation summaries fed back.</li><li>Pass-through when <code>--shacl</code> not set.</li></ul></div>
+        <div class="panel tone purple"><h3>Layer 4 — SPARQL CQ</h3><ul><li>CQs executed as ASK queries on live KG.</li><li>Exact failing triple patterns in feedback.</li><li>Deep failures escalate to schema re-alignment.</li><li>Cap via <code>CQ_SPARQL_MAX_RETRIES</code>.</li></ul></div>
+      </div>
+      <div class="content cols-2" style="margin-top:4px">
+        <div class="panel diagram"><div class="mermaid">stateDiagram-v2
+[*] --> Generate
+Generate --> Syntax
+Syntax --> Generate: SYNTAX_ERROR
+Syntax --> Logic: PASSED
+Logic --> Generate: LOGIC_ERROR
+Logic --> KG: APPROVED
+KG --> SHACL
+SHACL --> Generate: SHACL_ERROR
+SHACL --> SPARQL: pass/skip
+SPARQL --> Generate: CQ fail
+SPARQL --> Align: deep fail
+Align --> Generate
+SPARQL --> [*]: pass/skip</div></div>
+        <div class="panel"><h3>Combined retry budget</h3><p>All four loops share a single <code>retry_count</code> for YARRRML regeneration, with independent counters for SPARQL CQ retries. Later retries carry increasingly precise column-level and triple-pattern constraints.</p><div style="margin-top:12px"><span class="pill b">syntax ≤ 10</span><span class="pill g">logic ≤ 6</span><span class="pill o">shacl optional</span><span class="pill p">sparql ≤ 3</span></div></div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ SLIDE 7 — Schema Alignment -->
+    <section class="slide" data-title="Schema Alignment">
+      <div class="slide-header"><div class="slide-num">7</div><div><div class="title">Schema Alignment</div><p class="subtitle">Instead of dumping all columns into one mapping, the alignment agent produces a <em>functional entity plan</em> — a multi-node blueprint that drives every subsequent agent.</p></div></div>
+      <div class="content cols-2">
+        <div class="panel tone red">
+          <h3>❌ Flat Anti-Pattern</h3>
+          <p>All columns collapsed into one mapping. Merchants are plain strings, person details are literals, no object-property links exist. CQs like <em>"which merchant processed a fraud transaction?"</em> become impossible to answer.</p>
+          <pre>TransactionMapping:
+  s: ex:Transaction/$(trans_num)
+  po:
+    - [ex:merchant,  $(merchant), xsd:string]  # string, not IRI
+    - [ex:firstName, $(first),    xsd:string]
+    # No entity links, no address node, no metadata</pre>
+        </div>
+        <div class="panel tone green">
+          <h3>✅ Functional Entity Plan</h3>
+          <p>The alignment agent detected 5 semantic nodes, IRI-valued columns, inverse links, and a metadata sub-entity — producing this blueprint before any YARRRML is written.</p>
+          <pre>1. TransactionMapping   → ex:CreditCardTransaction
+   links: CreditCard~iri, Merchant~iri, Metadata~iri
+
+2. MerchantMapping      → ex:Merchant
+   inverse: eli:has_part → Transaction~iri
+
+3. PersonMapping        → schema:Person
+   link → Address~iri (schema:address)
+
+4. AddressMapping       → schema:PostalAddress
+
+5. TransactionMetadataMapping → ex:CreditCardTransactionMetadata</pre>
+        </div>
+      </div>
+      <div class="content" style="grid-template-columns:repeat(3,1fr); gap:14px; margin-top:4px">
+        <div class="card"><h4>🔗 Metadata node splitting</h4><p>Ontology property <code>lkg:metadata</code> detected → separate metadata mapping created with URI <code>ex:Transaction/$(trans_num)/Metadata</code>.</p></div>
+        <div class="card"><h4>👆 Inverse parent links</h4><p>Merchant and Person mappings carry <code>eli:has_part → Transaction~iri</code> so you can navigate from any entity back to its transactions.</p></div>
+        <div class="card"><h4>🌐 IRI column recognition</h4><p><code>cc_num</code> and <code>merchant</code> recognized as identifier columns — mapped as <code>~iri</code> inline, not as string literals.</p></div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ SLIDE 8 — YARRRML Coordinator -->
+    <section class="slide" data-title="Coordinator">
+      <div class="slide-header"><div class="slide-num">8</div><div><div class="title">YARRRML Coordinator</div><p class="subtitle">YARRRML production is split into focused sub-agents and a deterministic post-processing chain, avoiding one large hallucination-prone generation step.</p></div></div>
+      <div class="content cols-2">
+        <div class="panel diagram">
+          <div class="flow-rail">
+            <div class="flow-step"><div class="n">In</div><div><strong>Functional Entity Plan + CQs</strong><p>Produced by schema alignment and CQ generator.</p></div></div>
+            <div class="arrowline"></div>
+            <div class="flow-step"><div class="n">1</div><div><strong>PrefixAgent</strong><p>Generates and caches the prefix block. Skipped on retry when no new namespaces appear.</p></div></div>
+            <div class="arrowline"></div>
+            <div class="flow-step"><div class="n">2</div><div><strong>EntityAgent</strong><p>Builds mappings, subjects, rdf:type entries, and data property assertions.</p></div></div>
+            <div class="arrowline"></div>
+            <div class="flow-step"><div class="n">3</div><div><strong>RelationshipAgent</strong><p>Adds only missing object-property links when <code>multi_node=true</code>. Avoids re-emitting the full entity block.</p></div></div>
+            <div class="arrowline"></div>
+            <div class="flow-step"><div class="n">Out</div><div><strong>Final YARRRML</strong><p>Normalized paths, reconciled prefixes, debug artifacts saved per attempt.</p></div></div>
+          </div>
+        </div>
+        <div class="panel tight">
+          <div class="card-grid">
+            <div class="card"><h4>Prefix cache strategy</h4><p>Prefix regeneration skipped when the entity plan introduces no new namespaces. Cache invalidated on alignment re-runs.</p></div>
+            <div class="card"><h4>Auto-prefix reconciliation</h4><p>Undeclared prefixes resolved from ontology, a well-known prefix table, or a fallback namespace — without consuming a retry.</p></div>
+            <div class="card"><h4>Token efficiency</h4><p>Relationship agent avoids re-emitting the whole entity block, saving ~12K tokens per retry.</p></div>
+            <div class="card"><h4>Debug trail</h4><p>Each attempt saves <code>prefixes</code>, <code>entities</code>, <code>intermediate</code>, and <code>after_links</code> YAML artifacts.</p></div>
+          </div>
+          <pre style="margin-top:12px"># Coordinator steps
+# 1. prefixes = cached or regenerated
+# 2. entities = entity agent output
+# 3. intermediate = prefixes + mappings
+# 4. optional relationship enrichment
+# 5. normalize CSV source paths
+# 6. reconcile missing prefixes</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ SLIDE 9 — Refiner -->
+    <section class="slide" data-title="Refiner">
+      <div class="slide-header"><div class="slide-num">9</div><div><div class="title">Refiner Agent</div><p class="subtitle">The logic gate runs deterministic checks first, then uses LLM critique only where automation cannot safely decide.</p></div></div>
+      <div class="content">
+        <div class="card-grid">
+          <div class="card"><h4>Column coverage</h4><p>Extracts all referenced <code>$(columns)</code>, compares against CSV headers, and ignores known-empty columns via cached checks.</p></div>
+          <div class="card"><h4>Prefix auto-fix</h4><p>Resolves missing declarations from ontology prefixes or a known-prefix table without consuming a retry slot.</p></div>
+          <div class="card"><h4>IRI validation</h4><p>Ensures URL-valued columns use <code>~iri</code> rather than literal mapping treatment.</p></div>
+          <div class="card"><h4>FK validation</h4><p>Verifies same-CSV foreign keys use URI templates instead of invalid join patterns.</p></div>
+          <div class="card"><h4>Syntax normalization</h4><p>Accepts and normalizes brace-style templates and composite key patterns before the LLM sees them.</p></div>
+          <div class="card"><h4>Constraint injection</h4><p>On logic failure, the next retry receives per-column predicate and mapping constraints from the refiner.</p></div>
+        </div>
+        <div class="two-tone" style="margin-top:14px">
+          <div class="tone green"><h4>Why retries reduce over time</h4><p>The refiner feeds back actionable, mapping-specific constraints rather than generic criticism, narrowing the search space for each generation attempt.</p></div>
+          <div class="tone orange"><h4>Why false positives matter</h4><p>Non-actionable LLM feedback is filtered so harmless observations do not create endless logic-error loops.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ SLIDE 10 — State Model -->
+    <section class="slide" data-title="State Model">
+      <div class="slide-header"><div class="slide-num">10</div><div><div class="title">AgentState Model</div><p class="subtitle">All pipeline coordination flows through one typed state object — inputs, knowledge, intermediates, outputs, CQ tracking, and all retry controls.</p></div></div>
+      <div class="content cols-2">
+        <div class="panel diagram"><div class="mermaid">flowchart LR
+    subgraph IN[Inputs]
+        I1[csv_path]
+        I2[ontology_path]
+        I3[base_uri]
+        I4[competency_questions]
+        I5[user_sparql_queries]
+    end
+    subgraph K[Knowledge]
+        K1[schema_info]
+        K2[ontology_info]
+        K3[mapping_plan]
+        K4[schema_alignment]
+        K5[generated_cqs]
+    end
+    subgraph G[Generation]
+        G1[prefixes_output]
+        G2[entity_yarrrml]
+        G3[yarrrml_output]
+    end
+    subgraph O[Outputs]
+        O1[rdf_output]
+        O2[run_dir]
+        O3[sparql_validation_results]
+    end
+    subgraph C[Control]
+        C1[feedback]
+        C2[retry_count]
+        C3[cq_sparql_retry_count]
+        C4[shacl_enabled]
+        C5[sparql_enabled]
+    end
+    IN --> K
+    K --> G
+    G --> O
+    G --> C
+    C --> G</div></div>
+        <div class="panel">
+          <div class="card-grid">
+            <div class="card"><h4>Inputs</h4><p><code>csv_path</code>, <code>ontology_path</code>, <code>base_uri</code>, <code>competency_questions</code>, <code>user_sparql_queries</code></p></div>
+            <div class="card"><h4>Knowledge</h4><p><code>schema_info</code>, <code>ontology_info</code>, <code>mapping_plan</code>, <code>schema_alignment</code>, <code>generated_cqs</code></p></div>
+            <div class="card"><h4>Intermediates</h4><p><code>prefixes_output</code>, <code>entity_yarrrml</code>, <code>yarrrml_output</code>, prefix cache diff fields</p></div>
+            <div class="card"><h4>Outputs</h4><p><code>rdf_output</code>, timestamped <code>run_dir</code>, <code>sparql_validation_results</code></p></div>
+            <div class="card"><h4>CQ control</h4><p><code>cq_sparql_retry_count</code>, <code>persistent_cq_failures</code>, <code>sparql_enabled</code></p></div>
+            <div class="card"><h4>Error control</h4><p><code>feedback</code>, <code>retry_count</code>, <code>injected_column_constraints</code>, <code>shacl_enabled</code></p></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ SLIDE 11 — Evaluation -->
+    <section class="slide" data-title="Evaluation">
+      <div class="slide-header"><div class="slide-num">11</div><div><div class="title">Evaluation Framework</div><p class="subtitle">Three metric levels let pipeline health, KG fidelity, and structural completeness be measured independently and combined.</p></div></div>
+      <div class="content cols-3">
+        <div class="panel tone blue"><h3>Level 1 — Pipeline health</h3><p>Always available, zero cost.</p><div><span class="pill b">yarrrml produced</span><span class="pill b">syntax valid</span><span class="pill b">translatable</span><span class="pill b">materializable</span><span class="pill b">success</span><span class="pill b">retry count</span><span class="pill b">triples</span><span class="pill b">latency</span></div></div>
+        <div class="panel tone green"><h3>Level 2 — Gold comparison</h3><p>Precision, recall, and F1 after URI-tolerant normalization across triple, predicate, and class dimensions.</p><div><span class="pill g">triple F1</span><span class="pill g">predicate F1</span><span class="pill g">class F1</span><span class="pill g">object type mismatch</span></div></div>
+        <div class="panel tone orange"><h3>Level 3 — Column coverage</h3><p>Structural completeness through YARRRML template analysis and literal-value matching.</p><div><span class="pill o">columns total</span><span class="pill o">YARRRML coverage</span><span class="pill o">value coverage</span><span class="pill o">missing columns</span></div></div>
+      </div>
+      <div class="content cols-2">
+        <div class="panel"><h3>How to run</h3><pre>python main.py --eval 1 2 3 --gold data/gold/bikeshare_gold.nt
+python main.py --eval 1 --sparql --cqs "Which stations have docks?"
+python main.py --eval 1 --shacl --sparql</pre>
+          <p style="margin-top:10px">SPARQL CQ results are saved alongside <code>eval_metrics.json</code> in the run directory.</p>
+        </div>
+        <div class="panel"><h3>URI normalization for fair L2 comparison</h3><ul><li>Subject URIs collapse to row IDs.</li><li>Object URIs collapse to local names or referenced IDs.</li><li>Literals compare by lexical value.</li><li>IRI vs literal type preserved for diagnostics.</li></ul></div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════════════════════════════════════════ SLIDE 12 — LLM Config -->
+    <section class="slide" data-title="LLM Config">
+      <div class="slide-header"><div class="slide-num">12</div><div><div class="title">LLM Configuration & CLI</div><p class="subtitle">A flexible multi-provider system supports role-specific models, temperatures, and structured output mode. New flags unlock optional validation layers.</p></div></div>
+      <div class="content cols-2">
+        <div class="panel tone blue"><h3>LM Studio — local default</h3><pre>LLM_PROVIDER=lm_studio
+LM_STUDIO_URL=http://localhost:1234/v1
+LLM_MODEL_DEFAULT=qwen2.5-coder-14b-instruct</pre><ul><li>Full privacy and offline capability</li><li>Any OpenAI-format local server works</li><li>KV-cache helps with static system prompts</li></ul></div>
+        <div class="panel tone orange"><h3>Comet AI — cloud option</h3><pre>LLM_PROVIDER=comet
+COMET_API_KEY=your_key_here
+COMET_MODEL=gpt-4o</pre><ul><li>Access to frontier cloud models</li><li>Same ChatOpenAI-compatible client path</li><li>Global model override or per-role defaults</li></ul></div>
+      </div>
+      <div class="content cols-2">
+        <div class="panel">
+          <h3>New CLI flags</h3>
+          <table>
+            <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><code>--cqs "..."</code></td><td>Provide natural-language Competency Questions</td></tr>
+              <tr><td><code>--sparql-queries "ASK{}"</code></td><td>Provide SPARQL ASK queries directly (no LLM translation)</td></tr>
+              <tr><td><code>--sparql</code></td><td>Enable SPARQL-based CQ validation on the materialized KG</td></tr>
+              <tr><td><code>--shacl</code></td><td>Enable SHACL conformance checking via Astrea + pyshacl</td></tr>
+              <tr><td><code>--base-uri</code></td><td>Override the base namespace for all subject URIs</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <h3>Per-role temperature defaults</h3>
+          <table>
+            <thead><tr><th>Role</th><th>Temp</th><th>Timeout</th></tr></thead>
+            <tbody>
+              <tr><td>schema / mapper / CQ gen</td><td>0.3</td><td>120s</td></tr>
+              <tr><td>alignment / refiner / CQ→SPARQL</td><td>0.2</td><td>280s</td></tr>
+              <tr><td>entity / relationship</td><td>0.3</td><td>280s</td></tr>
+              <tr><td>prefix agent</td><td>0.2</td><td>120s</td></tr>
+            </tbody>
+          </table>
+          <p style="margin-top:10px">Every resolved model and temperature is stamped into <code>eval_metrics.json</code> for reproducible experiment tracking.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══════════════════════════════════════════════════ SLIDE 13 — IMDB Evaluation -->
+    <section class="slide" data-title="IMDB Evaluation">
+      <div class="slide-header">
+        <div class="slide-num">📊</div>
+        <div>
+          <div class="title">KG Quality Evaluation — IMDB Dataset</div>
+          <p class="subtitle">Unified F1 comparison of all five pipelines against the same gold-standard KG (49 triples, Hofer et al.). All runs use identical IMDB input (JSON → Flat CSV) and ontology.</p>
+        </div>
+      </div>
+
+      <!-- chips -->
+      <div class="chip-row">
+        <span class="chip orange">Ref A: GPT-4 0125-preview</span>
+        <span class="chip green">Ref B: Claude 3 Opus — Hofer et al.</span>
+        <span class="chip blue">Our α: Qwen 2.5 Coder 14B</span>
+        <span class="chip purple">Our β: Mistral Nemo 2407</span>
+        <span class="chip teal">Our γ: DeepSeek-R1-Distill-Qwen-14B ✦</span>
+        <span class="chip green">Gold: 49 triples</span>
+      </div>
+
+      <!-- validation banner -->
+      <div class="validation-banner">
+        <span class="vicon">✅</span>
+        <p class="vtxt">
+          <strong>All runs validated against Hofer et al.'s gold KG</strong> (49 triples) using their published test-case evaluation methodology.
+          Reference pipelines (GPT-4 · Claude 3 Opus) reproduced from the original study.
+          Our three models (Qwen · Mistral · DeepSeek-R1-Distill) are new runs on the same input and ontology.
+          F1 scores computed identically across all five pipelines.
+        </p>
+      </div>
+
+      <!-- triple count cards -->
+      <div class="triple-row">
+        <div class="tcard"><div class="tv tv-o">56</div><div class="tl">Ref A triples</div><div class="tn">GPT-4 0125-preview</div></div>
+        <div class="tcard"><div class="tv tv-g">40</div><div class="tl">Ref B triples</div><div class="tn">Claude 3 Opus</div></div>
+        <div class="tcard"><div class="tv tv-b">67</div><div class="tl">Our α triples</div><div class="tn">Qwen 2.5 Coder 14B</div></div>
+        <div class="tcard"><div class="tv tv-p">77</div><div class="tl">Our β triples</div><div class="tn">Mistral Nemo 2407</div></div>
+        <div class="tcard tc-hl"><div class="tv tv-t">67</div><div class="tl">Our γ triples ✦</div><div class="tn">DeepSeek-R1-Distill-Qwen-14B</div></div>
+      </div>
+
+      <!-- F1 table -->
+      <div>
+        <div class="ev-sec-label">F1 Score Breakdown — all models vs gold KG (49 triples)</div>
+        <div class="tbl-outer">
+          <table class="ev-table">
+            <thead>
+              <tr>
+                <th class="mc" style="background:rgba(37,99,235,.05);border-bottom:1px solid var(--border)"></th>
+                <th colspan="2" style="background:rgba(217,119,6,.07);color:var(--accent3);font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;text-align:center;border-bottom:1px solid rgba(217,119,6,.18);padding:5px 8px">📚 Hofer et al. Reference Pipelines</th>
+                <th colspan="3" style="background:rgba(37,99,235,.06);color:var(--accent);font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;text-align:center;border-left:2px solid rgba(15,23,42,.15);border-bottom:1px solid rgba(37,99,235,.16);padding:5px 8px">🤖 Our Automap Pipeline — Local LLMs</th>
+              </tr>
+              <tr>
+                <th class="mc">Metric</th>
+                <th class="th-ref">🟡 GPT-4<br><span style="font-weight:500;text-transform:none;letter-spacing:0;font-size:.63rem">0125-preview · Ref A</span></th>
+                <th class="th-ref2">🟢 Claude 3<br><span style="font-weight:500;text-transform:none;letter-spacing:0;font-size:.63rem">Opus · Ref B (Hofer)</span></th>
+                <th class="th-our">🔵 Qwen 14B<br><span style="font-weight:500;text-transform:none;letter-spacing:0;font-size:.63rem">2.5 Coder · Our α</span></th>
+                <th class="th-ourb">🟣 Mistral<br><span style="font-weight:500;text-transform:none;letter-spacing:0;font-size:.63rem">Nemo 2407 · Our β</span></th>
+                <th class="th-ds">🩵 DeepSeek-R1<br><span style="font-weight:500;text-transform:none;letter-spacing:0;font-size:.63rem">Distill-Qwen-14B · Our γ</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="ev-sec-row"><td colspan="6">Exact Match</td></tr>
+              <tr>
+                <td class="mc">Exact triple match</td>
+                <td class="vc vc-ref vc-m">0</td><td class="vc vc-ref2 vc-m">0</td><td class="vc vc-our vc-m">0</td><td class="vc vc-ourb vc-m">0</td><td class="vc vc-ds vc-m">0</td>
+              </tr>
+              <tr>
+                <td class="mc">Subject URIs (exact)</td>
+                <td class="vc vc-ref vc-m">0</td><td class="vc vc-ref2 vc-m">0</td><td class="vc vc-our vc-m">0</td><td class="vc vc-ourb vc-m">0</td><td class="vc vc-ds vc-m">0</td>
+              </tr>
+
+              <tr class="ev-sec-row"><td colspan="6">Entity &amp; Subject Coverage</td></tr>
+              <tr>
+                <td class="mc">Subject IDs (fuzzy, IRI-agnostic)</td>
+                <td class="vc vc-ref"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-o" style="width:100%"></div></div>1.000</div></td>
+                <td class="vc vc-ref2"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-g" style="width:100%"></div></div>1.000</div></td>
+                <td class="vc vc-our"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-b" style="width:95.7%"></div></div>0.957</div></td>
+                <td class="vc vc-ourb"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-p" style="width:100%"></div></div>1.000</div></td>
+                <td class="vc vc-ds"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-t" style="width:100%"></div></div>1.000</div></td>
+              </tr>
+
+              <tr class="ev-sec-row"><td colspan="6">Class Assignments</td></tr>
+              <tr>
+                <td class="mc">Class assignments (rdf:type)</td>
+                <td class="vc vc-ref"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-o" style="width:84.6%"></div></div>0.846</div></td>
+                <td class="vc vc-ref2"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-g" style="width:100%"></div></div>1.000</div></td>
+                <td class="vc vc-our"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-b" style="width:81.5%"></div></div>0.815</div></td>
+                <td class="vc vc-ourb" style="color:var(--danger)"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-r" style="width:38.5%"></div></div>0.385</div></td>
+                <td class="vc vc-ds"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-t" style="width:84.6%"></div></div>0.846</div></td>
+              </tr>
+              <tr>
+                <td class="mc">Unique classes used</td>
+                <td class="vc vc-ref"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-o" style="width:80%"></div></div>0.800</div></td>
+                <td class="vc vc-ref2"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-g" style="width:100%"></div></div>1.000</div></td>
+                <td class="vc vc-our"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-b" style="width:66.7%"></div></div>0.667</div></td>
+                <td class="vc vc-ourb"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-p" style="width:80%"></div></div>0.800</div></td>
+                <td class="vc vc-ds"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-t" style="width:80%"></div></div>0.800</div></td>
+              </tr>
+
+              <tr class="ev-sec-row"><td colspan="6">Predicate Coverage</td></tr>
+              <tr>
+                <td class="mc">Predicate usage</td>
+                <td class="vc vc-ref"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-o" style="width:66.7%"></div></div>0.667</div></td>
+                <td class="vc vc-ref2"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-g" style="width:89.9%"></div></div>0.899</div></td>
+                <td class="vc vc-our"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-b" style="width:67.2%"></div></div>0.672</div></td>
+                <td class="vc vc-ourb"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-p" style="width:60.3%"></div></div>0.603</div></td>
+                <td class="vc vc-ds"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-t" style="width:65.5%"></div></div>0.655</div></td>
+              </tr>
+              <tr>
+                <td class="mc">Unique predicates used</td>
+                <td class="vc vc-ref"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-o" style="width:69.3%"></div></div>0.693</div></td>
+                <td class="vc vc-ref2"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-g" style="width:86.2%"></div></div>0.862</div></td>
+                <td class="vc vc-our"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-b" style="width:50.5%"></div></div>0.505</div></td>
+                <td class="vc vc-ourb"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-p" style="width:44.7%"></div></div>0.447</div></td>
+                <td class="vc vc-ds"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-t" style="width:51.6%"></div></div>0.516</div></td>
+              </tr>
+
+              <tr class="ev-sec-row"><td colspan="6">Value Fidelity</td></tr>
+              <tr>
+                <td class="mc">Literal values</td>
+                <td class="vc vc-ref"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-o" style="width:83.3%"></div></div>0.833</div></td>
+                <td class="vc vc-ref2"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-g" style="width:100%"></div></div>1.000</div></td>
+                <td class="vc vc-our"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-b" style="width:66.7%"></div></div>0.667</div></td>
+                <td class="vc vc-ourb" style="color:var(--danger)"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-r" style="width:46.9%"></div></div>0.469</div></td>
+                <td class="vc vc-ds"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-t" style="width:64.8%"></div></div>0.648</div></td>
+              </tr>
+              <tr>
+                <td class="mc">URI object values</td>
+                <td class="vc vc-ref"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-o" style="width:48.9%"></div></div>0.489</div></td>
+                <td class="vc vc-ref2"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-g" style="width:76.9%"></div></div>0.769</div></td>
+                <td class="vc vc-our"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-b" style="width:46.8%"></div></div>0.468</div></td>
+                <td class="vc vc-ourb" style="color:var(--danger)"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-r" style="width:22.2%"></div></div>0.222</div></td>
+                <td class="vc vc-ds"><div class="ev-bar"><div class="ev-bg"><div class="ev-bf bf-t" style="width:48.9%"></div></div>0.489</div></td>
+              </tr>
+
+              <tr class="ev-avg-row">
+                <td class="mc">⌀ Average F1</td>
+                <td class="vc vc-ref" style="font-size:.9rem">0.592</td>
+                <td class="vc vc-ref2" style="font-size:.9rem">0.726</td>
+                <td class="vc vc-our" style="font-size:.9rem">0.528</td>
+                <td class="vc vc-ourb" style="font-size:.9rem;color:var(--danger)">0.436</td>
+                <td class="vc vc-ds" style="font-size:.9rem">
+                  <span style="color:var(--teal);font-size:1rem">0.550</span>
+                  <div style="margin-top:2px"><span class="ed edn" style="font-size:.58rem">−0.042 vs Ref A</span></div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Additional stats table -->
+      <div>
+        <div class="ev-sec-label">Additional Stats — entity presence &amp; typing</div>
+        <div class="tbl-outer">
+          <table class="ev-table">
+            <thead>
+              <tr>
+                <th class="mc" style="background:rgba(37,99,235,.05);border-bottom:1px solid var(--border)"></th>
+                <th colspan="2" style="background:rgba(217,119,6,.07);color:var(--accent3);font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;text-align:center;border-bottom:1px solid rgba(217,119,6,.18);padding:5px 8px">📚 Hofer et al. Reference Pipelines</th>
+                <th colspan="3" style="background:rgba(37,99,235,.06);color:var(--accent);font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;text-align:center;border-left:2px solid rgba(15,23,42,.15);border-bottom:1px solid rgba(37,99,235,.16);padding:5px 8px">🤖 Our Automap Pipeline — Local LLMs</th>
+              </tr>
+              <tr>
+                <th class="mc">Check</th>
+                <th class="th-ref">🟡 GPT-4</th>
+                <th class="th-ref2">🟢 Claude 3</th>
+                <th class="th-our">🔵 Qwen 14B</th>
+                <th class="th-ourb">🟣 Mistral</th>
+                <th class="th-ds">🩵 DeepSeek-R1 ✦</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td class="mc">All 10 persons present</td><td class="vc vc-ref"><span class="esb esb-y">✓</span></td><td class="vc vc-ref2"><span class="esb esb-y">✓</span></td><td class="vc vc-our"><span class="esb esb-y">✓</span></td><td class="vc vc-ourb"><span class="esb esb-y">✓</span></td><td class="vc vc-ds"><span class="esb esb-t">✓</span></td></tr>
+              <tr><td class="mc">All 4 actors present</td><td class="vc vc-ref"><span class="esb esb-y">✓</span></td><td class="vc vc-ref2"><span class="esb esb-y">✓</span></td><td class="vc vc-our"><span class="esb esb-y">✓</span></td><td class="vc vc-ourb"><span class="esb esb-y">✓</span></td><td class="vc vc-ds"><span class="esb esb-t">✓</span></td></tr>
+              <tr><td class="mc">Person entity count</td><td class="vc vc-ref"><span class="esb esb-v">20</span></td><td class="vc vc-ref2"><span class="esb" style="background:rgba(5,150,105,.1);color:var(--accent2)">14</span></td><td class="vc vc-our"><span class="esb esb-v">10</span></td><td class="vc vc-ourb"><span class="esb" style="background:rgba(124,58,237,.08);color:var(--accent4)">10</span></td><td class="vc vc-ds"><span class="esb esb-t">10</span></td></tr>
+              <tr><td class="mc">Actor entity count</td><td class="vc vc-ref"><span class="esb esb-v">8</span></td><td class="vc vc-ref2"><span class="esb" style="background:rgba(5,150,105,.1);color:var(--accent2)">8</span></td><td class="vc vc-our"><span class="esb esb-v">4</span></td><td class="vc vc-ourb"><span class="esb" style="background:rgba(124,58,237,.08);color:var(--accent4)">4</span></td><td class="vc vc-ds"><span class="esb esb-t">4</span></td></tr>
+              <tr><td class="mc">Persons typed dbo:Person</td><td class="vc vc-ref"><span class="esb esb-v">10</span></td><td class="vc vc-ref2"><span class="esb" style="background:rgba(5,150,105,.1);color:var(--accent2)">10</span></td><td class="vc vc-our"><span class="esb esb-y">10 ✓</span></td><td class="vc vc-ourb"><span class="esb esb-n">0 ✗</span></td><td class="vc vc-ds"><span class="esb esb-t">10 ✓</span></td></tr>
+              <tr><td class="mc">Actors typed dbo:Actor</td><td class="vc vc-ref"><span class="esb esb-n">0</span></td><td class="vc vc-ref2"><span class="esb" style="background:rgba(5,150,105,.1);color:var(--accent2)">4</span></td><td class="vc vc-our"><span class="esb esb-n">0 ✗</span></td><td class="vc vc-ourb"><span class="esb esb-y">4 ✓</span></td><td class="vc vc-ds"><span class="esb esb-n">0 ✗</span></td></tr>
+              <tr><td class="mc">All ref predicates mapped</td><td class="vc vc-ref"><span class="esb esb-n">✗</span></td><td class="vc vc-ref2"><span class="esb esb-n">✗</span></td><td class="vc vc-our"><span class="esb esb-n">✗</span></td><td class="vc vc-ourb"><span class="esb esb-n">✗</span></td><td class="vc vc-ds"><span class="esb esb-n">✗</span></td></tr>
+              <tr><td class="mc">Only ref predicates used</td><td class="vc vc-ref"><span class="esb esb-n">✗</span></td><td class="vc vc-ref2"><span class="esb esb-y">✓</span></td><td class="vc vc-our"><span class="esb esb-n">✗</span></td><td class="vc vc-ourb"><span class="esb esb-n">✗</span></td><td class="vc vc-ds"><span class="esb esb-n">✗</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- insight callout cards -->
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+        <div style="background:rgba(8,145,178,.07);border:1.5px solid rgba(8,145,178,.25);border-radius:16px;padding:13px 15px">
+          <div style="font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;font-weight:800;color:var(--teal);margin-bottom:5px">🩵 DeepSeek-R1-Distill highlights</div>
+          <ul style="padding-left:15px;color:var(--soft);font-size:.8rem;line-height:1.6">
+            <li>Best avg F1 of our three models — <strong style="color:var(--teal)">0.550</strong></li>
+            <li>Only −0.042 below GPT-4 reference</li>
+            <li>Perfect entity recall — all persons &amp; actors present</li>
+            <li>Class assignment F1 matches GPT-4 (0.846)</li>
+            <li>Matched GPT-4 on URI object values (0.489)</li>
+          </ul>
+        </div>
+        <div style="background:rgba(37,99,235,.05);border:1px solid rgba(37,99,235,.15);border-radius:16px;padding:13px 15px">
+          <div style="font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;font-weight:800;color:var(--accent);margin-bottom:5px">🔵 Qwen 14B highlights</div>
+          <ul style="padding-left:15px;color:var(--soft);font-size:.8rem;line-height:1.6">
+            <li>Avg F1 <strong style="color:var(--accent)">0.528</strong> — second of our models</li>
+            <li>Persons correctly typed as dbo:Person ✓</li>
+            <li>Best literal values among our three (0.667)</li>
+            <li>Actors not typed as dbo:Actor</li>
+          </ul>
+        </div>
+        <div style="background:rgba(124,58,237,.05);border:1px solid rgba(124,58,237,.15);border-radius:16px;padding:13px 15px">
+          <div style="font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;font-weight:800;color:var(--accent4);margin-bottom:5px">🟣 Mistral Nemo highlights</div>
+          <ul style="padding-left:15px;color:var(--soft);font-size:.8rem;line-height:1.6">
+            <li>Avg F1 <strong style="color:var(--danger)">0.436</strong> — weakest overall</li>
+            <li>Class assignment F1 drops to 0.385</li>
+            <li>Actors correctly typed as dbo:Actor ✓ (unique strength)</li>
+            <li>Persons not typed — traded one for the other</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- footer row -->
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;color:var(--muted);font-size:.74rem;border-top:1px solid var(--border);padding-top:10px">
+        <span><strong style="color:var(--soft)">Input:</strong> IMDB JSON → Flat CSV &nbsp;·&nbsp; <strong style="color:var(--soft)">Ontology:</strong> Hofer et al. &nbsp;·&nbsp; <strong style="color:var(--soft)">Gold KG:</strong> 49 triples</span>
+        <span>
+          <strong style="color:var(--soft)">Ref A</strong> GPT-4 · 56t · F1 0.592 &nbsp;·&nbsp;
+          <strong style="color:var(--soft)">Ref B</strong> Claude 3 Opus · 40t · F1 0.726 &nbsp;·&nbsp;
+          <strong style="color:var(--soft)">α</strong> Qwen · 67t · F1 0.528 &nbsp;·&nbsp;
+          <strong style="color:var(--soft)">β</strong> Mistral · 77t · F1 0.436 &nbsp;·&nbsp;
+          <strong style="color:var(--teal)">γ ✦</strong> DeepSeek-R1-Distill · 67t · F1 0.550
+        </span>
+      </div>
+    </section>
+
+  </main>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad:true,
+      theme:'neutral',
+      themeVariables:{
+        background:'#ffffff', mainBkg:'#eff6ff', primaryColor:'#eff6ff', primaryTextColor:'#0f172a',
+        primaryBorderColor:'#2563eb', lineColor:'#2563eb', secondaryColor:'#ecfdf5', tertiaryColor:'#f5f3ff',
+        nodeBorder:'#94a3b8', edgeLabelBackground:'#ffffff', fontFamily:'Satoshi, system-ui, sans-serif'
+      }
+    });
+
+    const deck = document.getElementById('deck');
+    const slides = Array.from(document.querySelectorAll('.slide'));
+    const navDots = document.getElementById('navDots');
+    const slideSelect = document.getElementById('slideSelect');
+    let current = 0;
+
+    slides.forEach((slide, i) => {
+      const btn = document.createElement('button');
+      btn.className = 'dot';
+      btn.setAttribute('aria-label', `Go to slide ${i+1}`);
+      btn.addEventListener('click', () => goTo(i));
+      navDots.appendChild(btn);
+
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.textContent = `${i+1}. ${slide.dataset.title || 'Slide'}`;
+      slideSelect.appendChild(opt);
+    });
+
+    function goTo(i){
+      current = Math.max(0, Math.min(slides.length - 1, i));
+      slides[current].scrollIntoView({behavior:'smooth', block:'start'});
+      updateUI();
+    }
+
+    function updateUI(){
+      document.querySelectorAll('.dot').forEach((d, i) => d.classList.toggle('active', i === current));
+      slideSelect.value = current;
+      document.getElementById('prevBtn').style.opacity = current === 0 ? .45 : 1;
+      document.getElementById('nextBtn').style.opacity = current === slides.length - 1 ? .45 : 1;
+    }
+
+    document.getElementById('prevBtn').addEventListener('click', () => goTo(current - 1));
+    document.getElementById('nextBtn').addEventListener('click', () => goTo(current + 1));
+    slideSelect.addEventListener('change', e => goTo(+e.target.value));
+
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          current = slides.indexOf(entry.target);
+          updateUI();
+        }
+      });
+    }, {root: deck, threshold: .55});
+
+    slides.forEach(slide => observer.observe(slide));
+
+    document.addEventListener('keydown', (e) => {
+      if (['ArrowRight','PageDown',' '].includes(e.key)) { e.preventDefault(); goTo(current + 1); }
+      if (['ArrowLeft','PageUp'].includes(e.key)) { e.preventDefault(); goTo(current - 1); }
+      if (e.key === 'Home') goTo(0);
+      if (e.key === 'End') goTo(slides.length - 1);
+    });
+
+    updateUI();
+  </script>
+</body>
+</html>
+
