@@ -26,25 +26,25 @@ stateDiagram-v2
     generate_yarrrml --> validate_yarrrml
 
     state validate_yarrrml <<choice>>
-    validate_yarrrml --> generate_yarrrml : Syntax Error (Retries < 10)
-    validate_yarrrml --> [*] : Syntax Error (Retries >= 10)
+    validate_yarrrml --> generate_yarrrml : Syntax Error (retries < RETRY_SYNTAX_MAX)
+    validate_yarrrml --> [*] : Syntax Error (cap reached)
     validate_yarrrml --> refine_logic : No Syntax Error
 
     state refine_logic <<choice>>
-    refine_logic --> generate_yarrrml : Logic Error (Retries < 6)
-    refine_logic --> [*] : Logic Error (Retries >= 6)
+    refine_logic --> generate_yarrrml : Logic Error (retries < RETRY_LOGIC_MAX)
+    refine_logic --> [*] : Logic Error (cap reached)
     refine_logic --> generate_kg : No Logic Error
 
     generate_kg --> shacl_validate
 
     state shacl_validate <<choice>>
-    shacl_validate --> generate_yarrrml : SHACL Violations (--shacl enabled)
-    shacl_validate --> sparql_validate_cqs : Conforms / --shacl not set
+    shacl_validate --> generate_yarrrml : SHACL Violations (retries < RETRY_SHACL_MAX)
+    shacl_validate --> sparql_validate_cqs : Conforms / --shacl not set / cap reached
 
     state sparql_validate_cqs <<choice>>
-    sparql_validate_cqs --> generate_yarrrml : CQ Failures (Retries < 3)
-    sparql_validate_cqs --> align_schema : CQ Failures (Deep Retry)
-    sparql_validate_cqs --> [*] : All CQs Pass / Cap Reached
+    sparql_validate_cqs --> generate_yarrrml : CQ Failures (retries < RETRY_CQ_MAX)
+    sparql_validate_cqs --> align_schema : CQ Failures (deep retry)
+    sparql_validate_cqs --> [*] : All CQs Pass / cap reached
 ```
 
 ### Key Features
@@ -358,8 +358,7 @@ automap/
 ├── evaluation/                      # Multi-level post-run evaluation framework
 │   ├── metrics.py                   #   Computes L1–L4 metrics (triple match, F1, column coverage, CQ %)
 │   ├── run_experiment.py            #   Batch experiment runner (multiple CSV inputs, aggregated results)
-│   ├── analyze_results.py           #   Aggregates and prints experiment result tables
-│   └── setup_gold.sh                #   Helper script to prepare gold KG files
+│   └── analyze_results.py           #   Aggregates and prints experiment result tables
 │
 ├── validation_hofer-et-al/          # Reproducibility benchmark (Hofer et al. comparison)
 │   ├── compare_my_pipeline.py       #   Side-by-side F1 comparison against the GPT-4 reference pipeline
@@ -367,7 +366,7 @@ automap/
 │   └── target/                      #   Comparison output artefacts (comparison_results.json)
 │
 ├── tools/                           # Developer utilities (not part of the core pipeline)
-│   ├── rml_tools.py                 #   Helpers for RML/YARRRML inspection and debugging
+│   └── rml_tools.py                 #   Helpers for RML/YARRRML inspection and debugging
 │
 ├── scripts/
 │   └── patch_morph_kgc.sh           # Applies Python 3.12 / Pandas 2.0 / NumPy 2.0 compatibility
